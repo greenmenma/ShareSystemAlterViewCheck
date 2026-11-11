@@ -23,11 +23,10 @@ if (string.Equals(sqlMode, "External", StringComparison.OrdinalIgnoreCase))
 }
 else
 {
-    // Docker：sa パスワードは Parameters:sql-password（未設定なら自動生成してユーザーシークレットに保存）
-    var password = builder.AddParameter("sql-password", secret: true);
+    // Docker：sa パスワードは Aspire が自動生成し、AppHost のユーザーシークレット（Parameters:sql-password）に保存する
     var hostPort = builder.Configuration.GetValue<int?>("Verification:SqlHostPort") ?? 14330;
 
-    var sql = builder.AddSqlServer("sql", password, hostPort)
+    var sql = builder.AddSqlServer("sql", port: hostPort)
         .WithLifetime(ContainerLifetime.Persistent)
         .WithDataVolume("sharesystemalterviewcheck-sqldata");
 
