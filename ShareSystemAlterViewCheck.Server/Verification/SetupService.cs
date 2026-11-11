@@ -4,7 +4,7 @@ using Microsoft.Data.SqlClient;
 namespace ShareSystemAlterViewCheck.Server.Verification;
 
 /// <summary>検証用オブジェクトの作成・削除・状態取得</summary>
-public sealed class SetupService(RunManager manager)
+public sealed class SetupService(RunManager manager, DatabaseBootstrapper bootstrapper)
 {
     private const string Actor = "Setup";
 
@@ -46,6 +46,7 @@ public sealed class SetupService(RunManager manager)
 
         try
         {
+            await bootstrapper.EnsureAsync(cs, ct);
             await using var conn = new SqlConnection(cs);
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
             timeout.CancelAfter(TimeSpan.FromSeconds(15));
@@ -119,6 +120,7 @@ public sealed class SetupService(RunManager manager)
         var status = RunStatus.Completed;
         try
         {
+            await bootstrapper.EnsureAsync(manager.ConnectionString, ct);
             await using var conn = new SqlConnection(manager.ConnectionString);
             await conn.OpenAsync(ct);
             ctx.Info(Actor, $"接続しました: {conn.DataSource} / {conn.Database}");

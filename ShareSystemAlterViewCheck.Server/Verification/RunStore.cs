@@ -11,6 +11,9 @@ public sealed class VerificationOptions
 
     /// <summary>1 回の検証の最大実行時間（分）</summary>
     public int MaxRunMinutes { get; set; } = 30;
+
+    /// <summary>接続先のデータベースがなければ作成する（デバッグ用・Docker の SQL Server 向け）</summary>
+    public bool CreateDatabaseIfNotExists { get; set; }
 }
 
 /// <summary>検証ログを 1 実行 1 ファイルの JSON として保存する</summary>
