@@ -67,7 +67,20 @@ GRANT VIEW SERVER STATE TO [ログイン名];  -- SQL Server 2022 以降は VIEW
 
 ## デバッグ
 
-デバッグ時は Docker の SQL Server でも検証できます（Docker Desktop / Podman が必要）。
+デバッグ時は Docker の SQL Server でも検証できます（Docker Desktop / Colima / Podman のいずれかが必要）。
+
+#### Mac（Apple Silicon）で Colima を使う場合
+
+Docker Desktop を使わず、無償の Colima で動かせます。SQL Server は x64 イメージのため Rosetta 2 を使います。
+
+```bash
+brew install colima docker docker-compose
+softwareupdate --install-rosetta --agree-to-license
+colima start --vm-type vz --vz-rosetta --cpus 4 --memory 6 --disk 40
+```
+
+- `docker compose` を使うには `~/.docker/config.json` に `"cliPluginsExtraDirs": ["/opt/homebrew/lib/docker/cli-plugins"]` を追加します。
+- Mac 再起動後は `colima start`（ログイン時に自動起動する場合は `brew services start colima`）。
 
 ### A. Aspire から起動（推奨）
 

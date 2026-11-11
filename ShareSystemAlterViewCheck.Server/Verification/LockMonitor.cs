@@ -21,6 +21,9 @@ public sealed class LockMonitor(RunContext ctx, string connectionString, int int
 
     private readonly Dictionary<short, BlockState> _blocked = new();
 
+    /// <summary>object_id → オブジェクト名（ロック待ちに巻き込まれないよう監視開始時に先読みする）</summary>
+    private readonly Dictionary<long, string> _objectNames = new();
+
     public long MaxBlockedMs { get; private set; }
     public long TotalBlockedMs { get; private set; }
     public int BlockCount { get; private set; }
@@ -37,8 +40,7 @@ public sealed class LockMonitor(RunContext ctx, string connectionString, int int
 
     private const string LockSql = """
         SELECT l.request_session_id, l.resource_type, l.request_mode, l.request_status,
-               CASE WHEN l.resource_type = 'OBJECT' THEN OBJECT_NAME(l.resource_associated_entity_id)
-                    ELSE CAST(l.resource_associated_entity_id AS nvarchar(40)) END AS resource_name
+               l.resource_associated_entity_id
         FROM sys.dm_tran_locks l
         WHERE l.resource_database_id = DB_ID()
           AND l.request_session_id IN (@a, @b)
@@ -52,7 +54,13 @@ public sealed class LockMonitor(RunContext ctx, string connectionString, int int
         {
             await using var conn = new SqlConnection(connectionString);
             await conn.OpenAsync(ct);
+            // 監視クエリ自体がメタデータのロック待ち（Sch-M 待機中のオブジェクト名解決など）に巻き込まれないようにする
+            await using (var init = new SqlCommand("SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED; SET LOCK_TIMEOUT 2000;", conn))
+            {
+                await init.ExecuteNonQueryAsync(ct);
+            }
             await CheckPermissionAsync(conn, ct);
+            await LoadObjectNamesAsync(conn, ct);
             ctx.Info(Actor, $"ロック監視を開始しました（間隔 {intervalMs}ms）");
 
             while (!ct.IsCancellationRequested)
@@ -97,6 +105,25 @@ public sealed class LockMonitor(RunContext ctx, string connectionString, int int
             _blocked.Clear();
             ctx.Info(Actor, "ロック監視を終了しました");
         }
+    }
+
+    private async Task LoadObjectNamesAsync(SqlConnection conn, CancellationToken ct)
+    {
+        await using var cmd = new SqlCommand("SELECT object_id, name FROM sys.objects WHERE name LIKE N'vt[_]%'", conn);
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+        {
+            _objectNames[reader.GetInt32(0)] = reader.GetString(1);
+        }
+    }
+
+    /// <summary>"OBJECT: 5:1093578934:0" のような待機リソースにオブジェクト名を付与する</summary>
+    private string DescribeResource(string resource)
+    {
+        var parts = resource.Replace("OBJECT:", "").Trim().Split(':');
+        return parts.Length >= 2 && long.TryParse(parts[1], out var id) && _objectNames.TryGetValue(id, out var name)
+            ? $"{resource}（{name}）"
+            : resource;
     }
 
     private async Task CheckPermissionAsync(SqlConnection conn, CancellationToken ct)
@@ -153,7 +180,7 @@ public sealed class LockMonitor(RunContext ctx, string connectionString, int int
                 .AppendLine($"待機セッション : {victim} (SPID {spid}) コマンド={info.Command}")
                 .AppendLine($"ブロック元     : {blocker} (SPID {info.Blocking})")
                 .AppendLine($"待機種別       : {info.WaitType}  待機時間={info.WaitMs}ms")
-                .AppendLine($"待機リソース   : {info.Resource}")
+                .AppendLine($"待機リソース   : {DescribeResource(info.Resource)}")
                 .AppendLine()
                 .AppendLine("--- ロック状況 (sys.dm_tran_locks) ---")
                 .AppendLine(locks)
@@ -199,6 +226,9 @@ public sealed class LockMonitor(RunContext ctx, string connectionString, int int
             $"ブロック解消: {ctx.ActorOf(spid)} の待機が終了しました（約 {duration:N0}ms）{(note is null ? "" : " ※" + note)}");
     }
 
+    private string ResourceName(string type, long entityId) =>
+        type == "OBJECT" && _objectNames.TryGetValue(entityId, out var name) ? name : entityId.ToString();
+
     private async Task<string> DescribeLocksAsync(SqlConnection conn, short a, short b, CancellationToken ct)
     {
         try
@@ -212,7 +242,7 @@ public sealed class LockMonitor(RunContext ctx, string connectionString, int int
             {
                 var spid = reader.GetInt32(0);
                 sb.AppendLine(
-                    $"{ctx.ActorOf((short)spid),-10} SPID {spid,-4} {reader.GetString(1),-9} {reader.GetString(2),-6} {reader.GetString(3),-7} {(reader.IsDBNull(4) ? "" : reader.GetString(4))}");
+                    $"{ctx.ActorOf((short)spid),-10} SPID {spid,-4} {reader.GetString(1),-9} {reader.GetString(2),-6} {reader.GetString(3),-7} {ResourceName(reader.GetString(1), reader.GetInt64(4))}");
             }
             return sb.Length == 0 ? "(取得できませんでした)" : sb.ToString();
         }
