@@ -1,0 +1,15 @@
+<Solution>
+  <Folder Name="/Solution Items/">
+    <File Path=".editorconfig" />
+    <File Path=".gitattributes" />
+    <File Path=".gitignore" />
+    <File Path="nuget.config" />
+    <File Path="README.md" />
+  </Folder>
+  <Project Path="ShareSystemAlterViewCheck.AppHost/ShareSystemAlterViewCheck.AppHost.csproj" />
+  <Project Path="ShareSystemAlterViewCheck.Client/ShareSystemAlterViewCheck.Client.esproj">
+    <Build Project="false" />
+    <Deploy />
+  </Project>
+  <Project Path="ShareSystemAlterViewCheck.Server/ShareSystemAlterViewCheck.Server.csproj" />
+</Solution>

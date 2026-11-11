@@ -1,0 +1,33 @@
+# ===== Claude Code 用（GitHub には上げない） =====
+CLAUDE.md
+CLAUDE.local.md
+.claude/
+
+# ===== .NET =====
+bin/
+obj/
+obj*/
+[Dd]ebug/
+[Rr]elease/
+*.user
+*.suo
+.vs/
+*.rsuser
+publish/
+PublishProfiles/*.pubxml.user
+
+# ===== 検証ログ =====
+**/App_Data/
+
+# ===== Node / Vite =====
+node_modules/
+dist/
+*.tsbuildinfo
+npm-debug.log*
+
+# ===== エディタ・OS =====
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db

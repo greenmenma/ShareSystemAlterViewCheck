@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.VisualStudio.JavaScript.Sdk/1.0.7204101">
+  <PropertyGroup>
+    <!-- VS から単体起動するときのコマンド -->
+    <StartupCommand>npm run dev</StartupCommand>
+    <JavaScriptTestRoot>src\</JavaScriptTestRoot>
+    <!-- 通常ビルドでは npm build を走らせない（発行時のみ dist を生成） -->
+    <ShouldRunBuildScript>false</ShouldRunBuildScript>
+    <!-- 発行時に Server 側の wwwroot へコピーされるフォルダ -->
+    <BuildOutputFolder>$(MSBuildProjectDirectory)\dist</BuildOutputFolder>
+  </PropertyGroup>
+</Project>
