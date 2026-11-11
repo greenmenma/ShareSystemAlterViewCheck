@@ -53,6 +53,12 @@ public sealed class SetupService(RunManager manager, DatabaseBootstrapper bootst
             await conn.OpenAsync(timeout.Token);
             status.Connected = true;
 
+            // 検証中（切替の Sch-M 待ちなど）でも画面の状態取得が固まらないようにする
+            await using (var init = new SqlCommand("SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED; SET LOCK_TIMEOUT 3000;", conn))
+            {
+                await init.ExecuteNonQueryAsync(ct);
+            }
+
             await using (var cmd = new SqlCommand(
                 "SELECT CONCAT(CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(40)), N' ', CAST(SERVERPROPERTY('Edition') AS nvarchar(100))), HAS_PERMS_BY_NAME(NULL, NULL, 'VIEW SERVER STATE')", conn))
             await using (var reader = await cmd.ExecuteReaderAsync(ct))
@@ -84,8 +90,15 @@ public sealed class SetupService(RunManager manager, DatabaseBootstrapper bootst
                 status.Objects.Add(info);
             }
 
-            status.ActiveViewTable = await DbObjects.GetActiveViewTableAsync(conn, ct);
-            status.ActiveSynonymTable = await DbObjects.GetActiveSynonymTableAsync(conn, ct);
+            try
+            {
+                status.ActiveViewTable = await DbObjects.GetActiveViewTableAsync(conn, ct);
+                status.ActiveSynonymTable = await DbObjects.GetActiveSynonymTableAsync(conn, ct);
+            }
+            catch (SqlException ex) when (ex.Number == 1222)
+            {
+                // 切替処理のロック待ちと重なった場合は参照先を空のまま返す
+            }
             var view = status.Objects.First(o => o.Name == DbObjects.PublicView);
             view.Definition = status.ActiveViewTable is null ? null : $"→ {status.ActiveViewTable}";
             var syn = status.Objects.First(o => o.Name == DbObjects.PublicSynonym);

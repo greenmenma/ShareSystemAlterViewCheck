@@ -110,7 +110,9 @@ export default function RunDetail({ id, onDeleted }: Props) {
                     <Metric label="エラー" value={`${s.errorCount} 件`} level={s.errorCount > 0 ? 'error' : 'success'} />
                     <Metric
                         label="切替/反映 最大時間"
-                        value={ms(Math.max(0, ...s.updates.map((u) => u.switchMs ?? 0)))}
+                        value={s.updates.some((u) => u.switchMs != null)
+                            ? ms(Math.max(...s.updates.map((u) => u.switchMs ?? 0)))
+                            : '—（未完了）'}
                         level="info"
                     />
                 </section>

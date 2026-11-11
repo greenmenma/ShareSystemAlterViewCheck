@@ -28,7 +28,7 @@ public sealed class ReaderWorker(RunContext ctx, string connectionString, Publis
             await using var conn = new SqlConnection(connectionString);
             await conn.OpenAsync(ct);
             var spid = await GetSpidAsync(conn, ct);
-            ctx.Sessions[spid] = actor;
+            using var session = ctx.Track(spid, actor);
 
             var resolved = await DbObjects.GetActiveTableAsync(conn, mode, ct);
             Result.ResolvedTable = resolved;

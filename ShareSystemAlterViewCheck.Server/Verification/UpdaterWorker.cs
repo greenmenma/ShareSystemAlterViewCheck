@@ -59,7 +59,7 @@ public sealed class UpdaterWorker(RunContext ctx, string connectionString, RunRe
             await using var conn = new SqlConnection(connectionString);
             await conn.OpenAsync(ct);
             var spid = await ReaderWorker.GetSpidAsync(conn, ct);
-            ctx.Sessions[spid] = Actor;
+            using var session = ctx.Track(spid, Actor);
             ctx.Info(Actor, $"接続しました SPID={spid}");
 
             if (req.UpdateType == UpdateType.Diff)
@@ -257,14 +257,14 @@ public sealed class UpdaterWorker(RunContext ctx, string connectionString, RunRe
         {
             await using var src = new SqlConnection(connectionString);
             await src.OpenAsync(ct);
-            ctx.Sessions[await ReaderWorker.GetSpidAsync(src, ct)] = Actor + "(取得元)";
+            using var srcSession = ctx.Track(await ReaderWorker.GetSpidAsync(src, ct), Actor + "(取得元)");
             await using var cmd = new SqlCommand(sourceSql, src) { CommandTimeout = 600 };
             await using var reader = await cmd.ExecuteReaderAsync(ct);
 
             // 書込側の接続も監視で識別できるよう SPID を登録する
             await using var dest = new SqlConnection(connectionString);
             await dest.OpenAsync(ct);
-            ctx.Sessions[await ReaderWorker.GetSpidAsync(dest, ct)] = Actor;
+            using var destSession = ctx.Track(await ReaderWorker.GetSpidAsync(dest, ct), Actor);
 
             using var bulk = new SqlBulkCopy(dest, SqlBulkCopyOptions.TableLock, null)
             {

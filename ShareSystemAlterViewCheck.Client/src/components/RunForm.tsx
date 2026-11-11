@@ -33,16 +33,16 @@ const presets: Preset[] = [
         expect: 'タイムアウト想定',
         expectLevel: 'error',
         description:
-            '公開テーブルを 60 秒間読み続けている間に全件更新。DROP TABLE が Sch-M ロックを待機し、CommandTimeout(30秒) で失敗する現象を再現します。',
+            '公開テーブルを 60 秒間読み続けている間に全件更新。DROP TABLE が読み取りの終了を待機（LCK_M_X / LCK_M_SCH_M）し、CommandTimeout(30秒) で失敗する現象を再現します。',
         request: { ...base, title: '① 現行: テーブル公開 × 長時間SELECT', mode: 'Table' },
     },
     {
         key: 'view',
         title: '② 改修後（ALTER VIEW）',
-        expect: '解消を確認',
-        expectLevel: 'success',
+        expect: '改修方式の検証',
+        expectLevel: 'warn',
         description:
-            '同じ条件をビュー公開で実行。非アクティブ側テーブルへ BulkCopy した後 ALTER VIEW で切り替えます。読み取り中のビューに対する ALTER VIEW の挙動を確認します。',
+            '同じ条件をビュー公開で実行。非アクティブ側テーブルへ BulkCopy した後 ALTER VIEW で切り替えます。読み取り中のビューに対する ALTER VIEW が待機するか（Sch-M ロック）を確認します。',
         request: { ...base, title: '② 改修後: ビュー公開 × 長時間SELECT', mode: 'View' },
     },
     {

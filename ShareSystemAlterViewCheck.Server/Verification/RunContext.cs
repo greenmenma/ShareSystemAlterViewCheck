@@ -134,6 +134,21 @@ public sealed class RunContext
         }
     }
 
+    /// <summary>
+    /// SPID をアクターとして登録し、Dispose で解除する。
+    /// 接続プールで同じ SPID が別の用途（画面の状態取得など）に再利用されたとき、誤ったアクター名で表示しないため。
+    /// </summary>
+    public IDisposable Track(short spid, string actor)
+    {
+        Sessions[spid] = actor;
+        return new SessionScope(this, spid, actor);
+    }
+
+    private sealed class SessionScope(RunContext ctx, short spid, string actor) : IDisposable
+    {
+        public void Dispose() => ctx.Sessions.TryRemove(new KeyValuePair<short, string>(spid, actor));
+    }
+
     public string ActorOf(short spid) =>
         Sessions.TryGetValue(spid, out var name) ? name : $"外部SPID {spid}";
 }
