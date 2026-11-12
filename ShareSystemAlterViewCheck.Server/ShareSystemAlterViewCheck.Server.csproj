@@ -24,6 +24,16 @@
     </ProjectReference>
   </ItemGroup>
 
+  <!-- デバッグ時：Client の node_modules がなければ npm install する（初回の VS デバッグ用） -->
+  <Target Name="DebugEnsureNodeEnv" BeforeTargets="Build" Condition=" '$(Configuration)' == 'Debug' And !Exists('$(SpaRoot)\node_modules') ">
+    <Exec Command="node --version" ContinueOnError="true">
+      <Output TaskParameter="ExitCode" PropertyName="NodeExitCode" />
+    </Exec>
+    <Error Condition="'$(NodeExitCode)' != '0'" Text="Node.js が必要です。https://nodejs.org/ からインストールして Visual Studio を再起動してください。" />
+    <Message Importance="high" Text="npm install を実行しています（初回のみ）..." />
+    <Exec WorkingDirectory="$(SpaRoot)" Command="npm install" />
+  </Target>
+
   <ItemGroup>
     <!-- 検証ログは発行物に含めない -->
     <Content Remove="App_Data\**" />

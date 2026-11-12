@@ -26,7 +26,6 @@ builder.Services.Configure<VerificationOptions>(builder.Configuration.GetSection
 builder.Services.AddSingleton<RunStore>();
 builder.Services.AddSingleton<RunManager>();
 builder.Services.AddSingleton<SetupService>();
-builder.Services.AddSingleton<DatabaseBootstrapper>();
 
 var app = builder.Build();
 

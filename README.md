@@ -65,58 +65,19 @@ SQL Server のデータ公開システムで発生する **全件更新時のロ
 GRANT VIEW SERVER STATE TO [ログイン名];  -- SQL Server 2022 以降は VIEW SERVER PERFORMANCE STATE でも可
 ```
 
-## デバッグ
+## デバッグ（Windows / Visual Studio）
 
-デバッグ時は Docker の SQL Server でも検証できます（Docker Desktop / Colima / Podman のいずれかが必要）。
+前提：Visual Studio 2026（ASP.NET と Web 開発・.NET Aspire のワークロード）、Node.js（LTS）。
 
-#### Mac（Apple Silicon）で Colima を使う場合
+1. 検証用 SQL Server の接続文字列を `ShareSystemAlterViewCheck.Server/appsettings.json` の `ConnectionStrings:VerifyDb` に記載します（DB は事前に作成しておきます）。
+2. スタートアップ プロジェクトを選んで F5 で起動します。
+   - `ShareSystemAlterViewCheck.AppHost`：Aspire ダッシュボード付きで Server を起動します。
+   - `ShareSystemAlterViewCheck.Server`（`https` プロファイル）：Server 単体で起動します。
+3. どちらも SpaProxy が Vite 開発サーバー（`https://localhost:52731`）を起動し、ブラウザーで画面が開きます。
 
-Docker Desktop を使わず、無償の Colima で動かせます。SQL Server は x64 イメージのため Rosetta 2 を使います。
-
-```bash
-brew install colima docker docker-compose
-softwareupdate --install-rosetta --agree-to-license
-colima start --vm-type vz --vz-rosetta --cpus 4 --memory 6 --disk 40
-```
-
-- `docker compose` を使うには `~/.docker/config.json` に `"cliPluginsExtraDirs": ["/opt/homebrew/lib/docker/cli-plugins"]` を追加します。
-- Mac 再起動後は `colima start`（ログイン時に自動起動する場合は `brew services start colima`）。
-
-### A. Aspire から起動（推奨）
-
-`ShareSystemAlterViewCheck.AppHost` をスタートアップにして実行します。検証用 SQL Server は AppHost の構成 `Verification:SqlMode` で切り替えます。
-
-| SqlMode | 動作 |
-| --- | --- |
-| `Docker`（既定） | SQL Server 2022 コンテナーを起動し、DB `ShareSystemVerify` を作成して Server に接続文字列を渡します。ホストのポートは `14330`（`Verification:SqlHostPort` で変更可）。コンテナーとデータボリュームは永続化されるので、再起動してもデータが残ります。 |
-| `External` | 既存の SQL Server を使います。AppHost のユーザーシークレットに `ConnectionStrings:VerifyDb` を設定してください。 |
-
-- sa のパスワードは Aspire が自動生成し、AppHost のユーザーシークレット（`Parameters:sql-password`）に保存します。SSMS などから接続するときは Aspire ダッシュボードの `sql` リソースで確認できます。
-- 既存サーバーに切り替える例：
-
-  ```bash
-  cd ShareSystemAlterViewCheck.AppHost
-  dotnet user-secrets set "Verification:SqlMode" "External"
-  dotnet user-secrets set "ConnectionStrings:VerifyDb" "Server=VERIFY-SQL;Database=ShareSystemVerify;Integrated Security=true;TrustServerCertificate=true"
-  ```
-
-### B. docker compose + Server 単体で起動
-
-```bash
-docker compose up -d          # SQL Server を localhost,14330 で起動（sa / Verify!Passw0rd）
-```
-
-その後 `ShareSystemAlterViewCheck.Server` の `https` プロファイルで起動します（SpaProxy が Vite 開発サーバー `https://localhost:52731` を起動）。
-
-- 接続先は `appsettings.Development.json` の `ConnectionStrings:VerifyDb`（docker-compose と同じ設定）です。
-- 開発環境では `Verification:CreateDatabaseIfNotExists=true` のため、DB `ShareSystemVerify` がなければ自動で作成します。
-- パスワードを変える場合は環境変数 `MSSQL_SA_PASSWORD` を指定して起動し、接続文字列も合わせてください。
-- 停止：`docker compose down`（データも消す場合は `docker compose down -v`）
-
-### 注意（Docker で検証する場合）
-
-- Apple Silicon の Mac では x64 イメージをエミュレーションで動かすため、BulkCopy などが実機より遅くなります。ロックの待機・タイムアウトの挙動の確認には問題ありません。
-- コンテナーの sa は `VIEW SERVER STATE` を持っているので、ブロッキング監視はそのまま使えます。
+- 初回のデバッグビルド時、Client の `node_modules` がなければ自動で `npm install` を実行します。
+- HTTPS の開発証明書は初回起動時に Visual Studio が信頼するか確認します（または `dotnet dev-certs https --trust`）。
+- デバッグ時だけ別の接続先を使いたい場合は、`appsettings.Development.json` に `ConnectionStrings:VerifyDb` を追加すると上書きされます。
 
 ## 発行と IIS 配置
 
