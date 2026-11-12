@@ -6,6 +6,9 @@
     <File Path="nuget.config" />
     <File Path="README.md" />
   </Folder>
+  <Folder Name="/Solution Items/docs/">
+    <File Path="docs/lock-verification-summary.md" />
+  </Folder>
   <Project Path="ShareSystemAlterViewCheck.AppHost/ShareSystemAlterViewCheck.AppHost.csproj" />
   <Project Path="ShareSystemAlterViewCheck.Client/ShareSystemAlterViewCheck.Client.esproj">
     <Build Project="false" />

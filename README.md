@@ -18,6 +18,8 @@ SQL Server のデータ公開システムで発生する **全件更新時のロ
 
 ## 検証の内容
 
+検証の経緯・結論・本命の方式のフローチャートは [docs/lock-verification-summary.md](docs/lock-verification-summary.md) にまとめています。
+
 | 方式 | 全件更新の手順 |
 | --- | --- |
 | 現行：テーブル公開 | `vt_PublicTable_New` 作成 → `vt_Source` から BulkCopy → `DROP TABLE vt_PublicTable` + `sp_rename` |
@@ -99,6 +101,8 @@ DDL（DROP / ALTER VIEW / SWITCH）が必要とする Sch-M ロックには効�
 | SWITCH（低優先度・読取1 が 120 秒） | ON | 1 分で切替を中止（エラー 1222） | なし |
 | 制御テーブル切替 × 2 回更新 | OFF | 成功。ただし 2 回目の DELETE が読取1 を約 36 秒待機（LCK_M_X） | なし |
 | 制御テーブル切替 × 2 回更新 | ON | 待機なしで成功 | なし |
+| 全件同期 MERGE（約 6 万行 UPDATE） | ON | 待機なしで成功（MERGE 約 1.5 秒） | なし |
+| 差分更新 MERGE | ON | 待機なしで成功 | なし |
 
 ログ量（SIMPLE・RCSI ON・30 万行 ≒ 270MB・2 回更新の合計）：
 
@@ -107,8 +111,6 @@ DDL（DROP / ALTER VIEW / SWITCH）が必要とする Sch-M ロックには効�
 | ⑨ 制御テーブル切替 + DELETE | 601 MB | 136 → 648 MB に膨張 | DELETE 284MB + DELETE 後の BulkCopy 289MB |
 | ⑧ 本命（BatchSize = 10,000） | 57 MB | 72 → 136 MB | BulkCopy 約 28MB / 回 |
 | ⑧ 本命（BatchSize = 0） | 4.4 MB | 増えず | BulkCopy 約 2.2MB / 回。後片付けは読取1 の終了を約 50 秒待機（公開・読み取りへの影響なし） |
-| 全件同期 MERGE（約 6 万行 UPDATE） | ON | 待機なしで成功（MERGE 約 1.5 秒） | なし |
-| 差分更新 MERGE | ON | 待機なしで成功 | なし |
 
 Read Replica（Always On の読み取り可能セカンダリ）は単一サーバーでは再現できないため、このアプリでは検証対象外です。
 セカンダリでも DDL を再生する redo スレッドは実行中の SELECT の Sch-S を待つため（redo がブロックされ、セカンダリの反映が遅れる）、DDL で入れ替える方式のままでは問題が残ります。
