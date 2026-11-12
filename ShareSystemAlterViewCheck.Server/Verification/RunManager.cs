@@ -147,6 +147,15 @@ public sealed class RunManager(
 
                 var rcsi = await DbObjects.GetReadCommittedSnapshotAsync(conn, ct);
                 ctx.Mutate(r => r.ReadCommittedSnapshot = rcsi);
+
+                var recovery = await DbObjects.GetRecoveryModelAsync(conn, ct);
+                var (_, logSize) = await DbObjects.GetLogStatsAsync(conn, ct);
+                ctx.Mutate(r =>
+                {
+                    r.RecoveryModel = recovery;
+                    r.LogFileStartMb = logSize;
+                });
+                ctx.Info(SystemActor, $"復旧モデル: {recovery} ／ ログファイル: {logSize:N0} MB");
                 ctx.Info(SystemActor, $"READ_COMMITTED_SNAPSHOT（RCSI）: {(rcsi == true ? "ON（読み取りは行バージョンを読み、S ロックを取らない）" : "OFF（読み取りは S ロックを取る）")}");
                 if (rcsi != true && (req.Mode == PublishMode.Control || req.UpdateType is UpdateType.Diff or UpdateType.FullSync))
                 {
@@ -208,6 +217,19 @@ public sealed class RunManager(
         }
         finally
         {
+            try
+            {
+                await using var conn = new SqlConnection(ConnectionString);
+                await conn.OpenAsync(CancellationToken.None);
+                var (_, logSize) = await DbObjects.GetLogStatsAsync(conn, CancellationToken.None);
+                ctx.Mutate(r => r.LogFileEndMb = logSize);
+                ctx.Info(SystemActor, $"終了時のログファイル: {logSize:N0} MB");
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "終了時のログファイルサイズを取得できませんでした");
+            }
+
             var summary = BuildSummary(ctx, monitor, updater, readers, status);
             ctx.Mutate(r => r.Summary = summary);
             var level = summary.VerdictLevel == "Success" ? "Success" : summary.VerdictLevel == "Error" ? "Error" : "Warn";
@@ -243,11 +265,20 @@ public sealed class RunManager(
         {
             summary.MaxBlockedMs = Math.Max(summary.MaxBlockedMs, monitor.MaxBlockedMs);
         }
-        summary.TimeoutCount = summary.Updates.Count(u => u.Result.Contains("タイムアウト"));
-        summary.ErrorCount = summary.Updates.Count(u => !u.Success && !u.Result.Contains("タイムアウト") && u.Result != "キャンセル")
+        summary.TimeoutCount = summary.Updates.Count(u => u.Result.Contains("タイムアウト") || u.Result.StartsWith("見送り", StringComparison.Ordinal));
+        summary.ErrorCount = summary.Updates.Count(u => !u.Success && !u.Result.Contains("タイムアウト") && !u.Result.StartsWith("見送り", StringComparison.Ordinal) && u.Result != "キャンセル")
                              + summary.Readers.Count(r => !r.Success && r.Result != "キャンセル");
 
-        var updaterBlocked = blocked.Where(p => p.Actor == UpdaterWorker.Actor).ToList();
+        summary.TotalLogMb = summary.Updates.Any(u => u.TotalLogMb.HasValue)
+            ? Math.Round(summary.Updates.Sum(u => u.TotalLogMb ?? 0), 1)
+            : null;
+
+        // 切替直後の後片付け（旧側を空にする）での待機は、公開に影響しないので分けて扱う
+        bool InCleanup(RunPhase p) => summary.Updates.Any(u =>
+            u.CleanupStartMs is long cs && p.StartMs >= cs && p.StartMs <= (u.CleanupEndMs ?? long.MaxValue));
+        var cleanupBlocked = blocked.Where(p => p.Actor == UpdaterWorker.Actor && InCleanup(p)).ToList();
+        summary.CleanupMaxBlockedMs = cleanupBlocked.Count == 0 ? 0 : cleanupBlocked.Max(p => (p.EndMs ?? p.StartMs) - p.StartMs);
+        var updaterBlocked = blocked.Where(p => p.Actor == UpdaterWorker.Actor && !InCleanup(p)).ToList();
         var updaterMaxBlocked = updaterBlocked.Count == 0 ? 0 : updaterBlocked.Max(p => (p.EndMs ?? p.StartMs) - p.StartMs);
 
         // 後から来た読み取りの待機（ロック監視の検出 + 最初の行が返るまでの時間）
@@ -318,6 +349,10 @@ public sealed class RunManager(
             summary.Verdict = updaterBlocked.Count == 0
                 ? "更新はロック待機なしで成功 — ロック問題は発生しませんでした"
                 : $"更新は成功（ごく短いロック待機 {updaterMaxBlocked:N0}ms のみ）";
+            if (summary.CleanupMaxBlockedMs >= 1000)
+            {
+                summary.Verdict += $"（切替後の旧側の後片付けは、古い読み取りの終了を最大 {summary.CleanupMaxBlockedMs:N0}ms 待機）";
+            }
             summary.VerdictLevel = "Success";
         }
         return summary;
@@ -334,6 +369,7 @@ public sealed class RunManager(
         req.DiffRowCount = Math.Clamp(req.DiffRowCount, 1, 1_000_000);
         req.MonitorIntervalMs = Math.Clamp(req.MonitorIntervalMs, 100, 10_000);
         req.LowPriorityMaxMinutes = Math.Clamp(req.LowPriorityMaxMinutes, 1, 60);
+        req.BulkBatchSize = Math.Clamp(req.BulkBatchSize, 0, 10_000_000);
         foreach (var r in req.Readers)
         {
             r.StartDelaySec = Math.Clamp(r.StartDelaySec, 0, 3600);
@@ -369,11 +405,20 @@ public sealed class RunManager(
             $"更新種別       : {UpdaterWorker.UpdateTypeText(req.UpdateType)}{(req.UpdateType == UpdateType.Diff ? $"（{req.DiffRowCount:N0}行）" : "")}",
             $"更新開始       : {req.UpdaterStartDelaySec}秒後 × {req.UpdateCount}回（間隔 {req.UpdateIntervalSec}秒）",
             $"CommandTimeout : {req.CommandTimeoutSec}秒",
+            $"BulkCopy       : BatchSize = {(req.BulkBatchSize == 0 ? "0（全件を 1 バッチ）" : req.BulkBatchSize.ToString("N0"))}",
             $"LOCK_TIMEOUT   : {(req.LockTimeoutMs < 0 ? "無制限(-1)" : req.LockTimeoutMs + "ms")}",
         };
         if (req.Mode is PublishMode.View or PublishMode.Synonym or PublishMode.Control && req.UpdateType == UpdateType.Full)
         {
             lines.Add($"非アクティブ準備: {req.InactivePrep}");
+            if (req.InactivePrep == InactivePrep.SwitchOut)
+            {
+                lines.Add($"退避の低優先度  : MAX_DURATION = {req.LowPriorityMaxMinutes} MINUTES, ABORT_AFTER_WAIT = {req.LowPriorityAbort.ToString().ToUpperInvariant()}");
+            }
+        }
+        if (req.Mode == PublishMode.Control && req.UpdateType == UpdateType.Full)
+        {
+            lines.Add($"切替後の後片付け: {(req.CleanupAfterSwitch ? "する（切替の直後に旧側を空にする）" : "しない（次回の更新時に空にする）")}");
         }
         if (req.Mode == PublishMode.Switch && req.UpdateType == UpdateType.Full)
         {

@@ -35,6 +35,9 @@ public static class DbObjects
     public const string CtlB = "vt_Ctl_B";
     public const string CtlActive = "vt_CtlActive";
 
+    /// <summary>非アクティブ側を SWITCH で退避して TRUNCATE するための空テーブル（読み取りから参照されない）</summary>
+    public const string CtlTrash = "vt_Ctl_Trash";
+
     /// <summary>差分更新・全件同期用のステージングテーブル</summary>
     public const string DiffStage = "vt_DiffStage";
 
@@ -143,6 +146,42 @@ public static class DbObjects
         PublishMode.Switch => Task.FromResult<string?>(SwPublic),
         _ => Task.FromResult<string?>(PublicTable),
     };
+
+    /// <summary>復旧モデル</summary>
+    public static async Task<string?> GetRecoveryModelAsync(SqlConnection conn, CancellationToken ct)
+    {
+        await using var cmd = new SqlCommand("SELECT recovery_model_desc FROM sys.databases WHERE database_id = DB_ID()", conn);
+        return await cmd.ExecuteScalarAsync(ct) as string;
+    }
+
+    /// <summary>ログファイルの書込バイト数（累計）とサイズ（MB）。VIEW SERVER STATE がない場合は書込量が null</summary>
+    public static async Task<(long? BytesWritten, double? SizeMb)> GetLogStatsAsync(SqlConnection conn, CancellationToken ct)
+    {
+        long? written = null;
+        double? size = null;
+        try
+        {
+            await using (var cmd = new SqlCommand(
+                "SELECT SUM(CAST(size AS bigint)) * 8 / 1024.0 FROM sys.database_files WHERE type = 1", conn))
+            {
+                size = await cmd.ExecuteScalarAsync(ct) is decimal d ? (double)d : null;
+            }
+            await using (var cmd = new SqlCommand("""
+                SELECT SUM(v.num_of_bytes_written)
+                FROM sys.dm_io_virtual_file_stats(DB_ID(), NULL) v
+                JOIN sys.database_files f ON f.file_id = v.file_id
+                WHERE f.type = 1
+                """, conn))
+            {
+                written = await cmd.ExecuteScalarAsync(ct) is long w ? w : null;
+            }
+        }
+        catch (SqlException)
+        {
+            // 権限不足など。ログ量は表示しない
+        }
+        return (written, size);
+    }
 
     /// <summary>READ_COMMITTED_SNAPSHOT（RCSI）の設定</summary>
     public static async Task<bool?> GetReadCommittedSnapshotAsync(SqlConnection conn, CancellationToken ct)

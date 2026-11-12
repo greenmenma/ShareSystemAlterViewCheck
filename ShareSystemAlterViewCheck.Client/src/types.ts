@@ -5,7 +5,7 @@ export type UpdateType = 'Full' | 'Diff' | 'FullSync';
 export type LowPriorityAbort = 'None' | 'Self' | 'Blockers';
 export type ReaderKind = 'SlowRead' | 'HoldLock' | 'HeavyQuery';
 export type ReaderTrigger = 'RunStart' | 'BeforeSwitch' | 'SwitchBlocked' | 'SwitchStarted';
-export type InactivePrep = 'Truncate' | 'DropCreate' | 'Delete';
+export type InactivePrep = 'Truncate' | 'DropCreate' | 'Delete' | 'SwitchOut';
 export type RunStatus = 'Running' | 'Completed' | 'Cancelled' | 'Failed' | 'Aborted';
 export type RunKind = 'Verification' | 'Setup';
 export type Level = 'Info' | 'Success' | 'Warn' | 'Error' | 'Sql';
@@ -35,6 +35,10 @@ export interface RunRequest {
     diffRowCount: number;
     monitorIntervalMs: number;
     /** SWITCH 方式：WAIT_AT_LOW_PRIORITY を付けるか（古いログには無い） */
+    /** SqlBulkCopy の BatchSize（0 = 全件を 1 バッチ）。古いログには無い */
+    bulkBatchSize?: number;
+    /** 制御テーブル切替：切替の直後に旧側を空にする */
+    cleanupAfterSwitch?: boolean;
     switchLowPriority?: boolean;
     lowPriorityMaxMinutes?: number;
     lowPriorityAbort?: LowPriorityAbort;
@@ -71,6 +75,15 @@ export interface UpdateResult {
     switchMs?: number | null;
     switchStartMs?: number | null;
     switchEndMs?: number | null;
+    cleanupMs?: number | null;
+    cleanupStartMs?: number | null;
+    cleanupEndMs?: number | null;
+    cleanupResult?: string | null;
+    prepareLogMb?: number | null;
+    bulkCopyLogMb?: number | null;
+    switchLogMb?: number | null;
+    cleanupLogMb?: number | null;
+    totalLogMb?: number | null;
     rowsCopied: number;
     fromTable?: string | null;
     toTable?: string | null;
@@ -103,6 +116,8 @@ export interface RunSummary {
     switchOverlapped?: boolean;
     readerBlockCount?: number;
     readerMaxBlockedMs?: number;
+    cleanupMaxBlockedMs?: number;
+    totalLogMb?: number | null;
     updates: UpdateResult[];
     readers: ReaderResult[];
 }
@@ -117,6 +132,9 @@ export interface RunRecord {
     request?: RunRequest | null;
     serverInfo?: string | null;
     readCommittedSnapshot?: boolean | null;
+    recoveryModel?: string | null;
+    logFileStartMb?: number | null;
+    logFileEndMb?: number | null;
     events: RunEvent[];
     phases: RunPhase[];
     summary?: RunSummary | null;
@@ -165,6 +183,8 @@ export interface EnvironmentStatus {
     activeControlTable?: string | null;
     readCommittedSnapshot?: boolean | null;
     canAlterDatabase?: boolean;
+    recoveryModel?: string | null;
+    logFileMb?: number | null;
     objects: DbObjectInfo[];
     runActive: boolean;
     activeRunId?: string | null;

@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { api } from '../api';
 import {
-    actorLabel, dateTime, downloadText, lowPriorityAbortLabel, modeLabel, ms, readerKindLabel, readerWhen, statusLabel, updateTypeLabel,
+    actorLabel, dateTime, downloadText, inactivePrepLabel, lowPriorityAbortLabel, mb, modeLabel, ms, readerKindLabel, readerWhen, statusLabel, updateTypeLabel,
 } from '../format';
 import type { RunRecord } from '../types';
 import EventLog from './EventLog';
@@ -114,6 +114,19 @@ export default function RunDetail({ id, onDeleted }: Props) {
                     {s.switchOverlapped != null && s.readers.length > 0 && (
                         <Metric label="切替時の読み取り" value={s.switchOverlapped ? '実行中（成立）' : 'なし（不成立）'} level={s.switchOverlapped ? 'success' : 'warn'} />
                     )}
+                    {s.totalLogMb != null && (
+                        <Metric label="ログ書込量（合計）" value={mb(s.totalLogMb)} level={s.totalLogMb >= 100 ? 'warn' : 'success'} />
+                    )}
+                    {run.logFileStartMb != null && run.logFileEndMb != null && (
+                        <Metric
+                            label="ログファイル（開始 → 終了）"
+                            value={`${Math.round(run.logFileStartMb).toLocaleString()} → ${Math.round(run.logFileEndMb).toLocaleString()} MB`}
+                            level={run.logFileEndMb > run.logFileStartMb ? 'warn' : 'success'}
+                        />
+                    )}
+                    {(s.cleanupMaxBlockedMs ?? 0) > 0 && (
+                        <Metric label="後片付けの待機（公開に影響なし）" value={ms(s.cleanupMaxBlockedMs)} level="info" />
+                    )}
                     <Metric
                         label="切替/反映 最大時間"
                         value={s.updates.some((u) => u.switchMs != null)
@@ -132,9 +145,17 @@ export default function RunDetail({ id, onDeleted }: Props) {
                         <span><b>更新種別</b>{updateTypeLabel[req.updateType]}{req.updateType === 'Diff' ? `（${req.diffRowCount.toLocaleString()}行）` : ''}</span>
                         <span><b>更新</b>{req.updaterStartDelaySec}秒後 × {req.updateCount}回{req.updateCount > 1 ? `（間隔${req.updateIntervalSec}秒）` : ''}</span>
                         <span><b>CommandTimeout</b>{req.commandTimeoutSec}秒</span>
+                        {req.bulkBatchSize != null && <span><b>BulkCopy BatchSize</b>{req.bulkBatchSize === 0 ? '0（全件 1 バッチ）' : req.bulkBatchSize.toLocaleString()}</span>}
                         <span><b>LOCK_TIMEOUT</b>{req.lockTimeoutMs < 0 ? '無制限' : `${req.lockTimeoutMs}ms`}</span>
                         {run.readCommittedSnapshot != null && <span><b>RCSI</b>{run.readCommittedSnapshot ? 'ON' : 'OFF'}</span>}
-                        {['View', 'Synonym', 'Control'].includes(req.mode) && req.updateType === 'Full' && <span><b>非アクティブ準備</b>{req.inactivePrep}</span>}
+                        {run.recoveryModel && <span><b>復旧モデル</b>{run.recoveryModel}</span>}
+                        {['View', 'Synonym', 'Control'].includes(req.mode) && req.updateType === 'Full' && (
+                            <span><b>非アクティブ準備</b>{inactivePrepLabel[req.inactivePrep].split('（')[0]}
+                                {req.inactivePrep === 'SwitchOut' ? `（MAX_DURATION ${req.lowPriorityMaxMinutes ?? 1}分 / ${(req.lowPriorityAbort ?? 'Self').toUpperCase()}）` : ''}</span>
+                        )}
+                        {req.mode === 'Control' && req.updateType === 'Full' && (
+                            <span><b>切替後の後片付け</b>{req.cleanupAfterSwitch ? '切替の直後に旧側を空にする' : 'しない'}</span>
+                        )}
                         {req.mode === 'Switch' && req.updateType === 'Full' && (
                             <span><b>SWITCH 低優先度</b>{req.switchLowPriority === false
                                 ? 'なし'
@@ -170,7 +191,8 @@ export default function RunDetail({ id, onDeleted }: Props) {
                                 <thead>
                                     <tr>
                                         <th>更新</th><th>結果</th><th>対象</th><th className="num">準備</th><th className="num">BulkCopy</th>
-                                        <th className="num">切替/反映</th><th className="num">合計</th><th className="num">行数</th>
+                                        <th className="num">切替/反映</th><th className="num">後片付け</th><th className="num">合計</th><th className="num">行数</th>
+                                        <th className="num">ログ（準備 / BulkCopy / 切替 / 後片付け）</th>
                                     </tr>
                                 </thead>
                                 <tbody>
@@ -183,8 +205,16 @@ export default function RunDetail({ id, onDeleted }: Props) {
                                             <td className="num">{ms(u.prepareMs)}</td>
                                             <td className="num">{ms(u.bulkCopyMs)}</td>
                                             <td className="num strong">{ms(u.switchMs)}</td>
+                                            <td className="num">{u.cleanupResult
+                                                ? <>{ms(u.cleanupMs)}<div className="small">{u.cleanupResult}</div></>
+                                                : '—'}</td>
                                             <td className="num">{ms(u.totalMs)}</td>
                                             <td className="num">{u.rowsCopied.toLocaleString()}</td>
+                                            <td className="num small">
+                                                {u.totalLogMb == null ? '—' : (
+                                                    <><b>{mb(u.totalLogMb)}</b><br />{mb(u.prepareLogMb)} / {mb(u.bulkCopyLogMb)} / {mb(u.switchLogMb)} / {mb(u.cleanupLogMb)}</>
+                                                )}
+                                            </td>
                                         </tr>
                                     ))}
                                 </tbody>

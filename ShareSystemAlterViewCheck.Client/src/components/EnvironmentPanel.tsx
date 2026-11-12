@@ -54,6 +54,11 @@ export default function EnvironmentPanel({ env, loading, onRefresh, onStarted }:
                         )}
                         {env?.error && <div className="error-text">{env.error}</div>}
                     </dd>
+                    <dt>復旧モデル</dt>
+                    <dd>
+                        {env?.recoveryModel ?? '—'}
+                        {env?.logFileMb != null && <span className="hint">（ログファイル {Math.round(env.logFileMb).toLocaleString()} MB）</span>}
+                    </dd>
                     <dt>VIEW SERVER STATE</dt>
                     <dd>
                         {env?.hasViewServerState ? (

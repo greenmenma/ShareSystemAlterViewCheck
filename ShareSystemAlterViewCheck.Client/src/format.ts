@@ -1,4 +1,4 @@
-import type { LowPriorityAbort, PublishMode, ReaderKind, ReaderSpec, ReaderTrigger, RunStatus, UpdateType } from './types';
+import type { InactivePrep, LowPriorityAbort, PublishMode, ReaderKind, ReaderSpec, ReaderTrigger, RunStatus, UpdateType } from './types';
 
 export const modeLabel: Record<PublishMode, string> = {
     Table: 'テーブル公開（現行）',
@@ -27,6 +27,19 @@ export const updateTypeShort: Record<UpdateType, string> = {
     Diff: '差分更新',
     FullSync: '全件同期',
 };
+
+export const inactivePrepLabel: Record<InactivePrep, string> = {
+    SwitchOut: '低優先度 SWITCH で退避 + TRUNCATE（ログほぼなし）',
+    Truncate: 'TRUNCATE TABLE',
+    DropCreate: 'DROP + CREATE TABLE',
+    Delete: 'DELETE FROM（全行をログに記録）',
+};
+
+/** MB 表示（null は —） */
+export function mb(value?: number | null): string {
+    if (value === undefined || value === null) return '—';
+    return `${value.toLocaleString(undefined, { maximumFractionDigits: 1 })} MB`;
+}
 
 export const lowPriorityAbortLabel: Record<LowPriorityAbort, string> = {
     Self: 'SELF（時間切れで切替をあきらめる）',

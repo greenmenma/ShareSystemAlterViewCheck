@@ -24,7 +24,19 @@ SQL Server のデータ公開システムで発生する **全件更新時のロ
 | 改修案：ビュー公開（Blue/Green） | 非アクティブ側（`vt_View_Blue` / `vt_View_Green`）を空にする → BulkCopy → `ALTER VIEW vt_PublicView` |
 | 参考：シノニム公開 | 非アクティブ側を空にする → BulkCopy → `DROP SYNONYM` / `CREATE SYNONYM` |
 | 代替案：ALTER TABLE SWITCH | `vt_SwStage` へ BulkCopy → `ALTER TABLE vt_SwPublic SWITCH TO vt_SwOld WITH (WAIT_AT_LOW_PRIORITY …)` → `ALTER TABLE vt_SwStage SWITCH TO vt_SwPublic` |
-| 代替案：制御テーブル切替 | 非アクティブ側（`vt_Ctl_A` / `vt_Ctl_B`）を DELETE で空にする → BulkCopy → `UPDATE vt_CtlActive SET ActiveSide = …`（ビュー `vt_CtlView` の定義は固定） |
+| 代替案：制御テーブル切替 | 空の非アクティブ側（`vt_Ctl_A` / `vt_Ctl_B`）へ BulkCopy → `UPDATE vt_CtlActive SET ActiveSide = …`（ビュー `vt_CtlView` の定義は固定）→ 旧側を空にする（下記） |
+
+制御テーブル切替の「非アクティブ側を空にする方法」は次から選べます。「切替後の後片付け」を有効にすると、切替の直後に旧側を空にしておき、次回の更新ではすぐ BulkCopy できます。
+
+| 空にする方法 | ログ | 読み取りへの影響 |
+| --- | --- | --- |
+| 低優先度 SWITCH で退避 + TRUNCATE（推奨） | ほぼなし | 古い読み取りの終了を待つが、後から来た読み取りは止めない。待機時間切れなら、後片付けは次回に持ち越し、準備段階なら更新を見送る |
+| DELETE | 全行を記録（さらに、その後の BulkCopy も最小ログにならない） | RCSI なら待たない |
+| TRUNCATE / DROP + CREATE | ほぼなし | ビューを読む SELECT は両側に Sch-S を持つため、読み取り中は待機し、後から来た読み取りも止める |
+
+BulkCopy の BatchSize も指定できます。SIMPLE（または BULK_LOGGED）で空のテーブルへ `TABLOCK` 付きで投入する場合、BatchSize = 0（全件を 1 バッチ）にするとログが最小になります。
+
+各更新の段階（準備 / BulkCopy / 切替 / 後片付け）ごとのログ書込量と、検証の開始・終了時のログファイルサイズを記録・表示します（`VIEW SERVER STATE` が必要）。
 
 | 更新種別 | 手順 |
 | --- | --- |
@@ -60,7 +72,7 @@ DDL（DROP / ALTER VIEW / SWITCH）が必要とする Sch-M ロックには効�
 
 ### プリセットシナリオ
 
-①②④⑥⑦⑧⑨⑩は「読取1 が切替の 10 秒前から読み続ける → 切替 → 切替開始の 5 秒後に読取2 が新たに SELECT」の順序で実行します。
+①②④⑥⑦⑧⑨⑩⑪は「読取1 が切替の 10 秒前から読み続ける → 切替 → 切替開始の 5 秒後に読取2 が新たに SELECT」の順序で実行します。
 
 | # | シナリオ | RCSI 前提 |
 | --- | --- | --- |
@@ -71,9 +83,10 @@ DDL（DROP / ALTER VIEW / SWITCH）が必要とする Sch-M ロックには効�
 | ⑤ | 差分更新 × HOLDLOCK（ロックヒントは RCSI でもロックを取る） | |
 | ⑥ | 代替案：SWITCH + 低優先度待機（切替は読取1 の終了を待つが、読取2 は止まらない） | |
 | ⑦ | 代替案：SWITCH 低優先度・時間切れ（ABORT_AFTER_WAIT = SELF で切替を中止） | |
-| ⑧ | 代替案：制御テーブル切替（DDL なし。2 回目の更新で読取1 が読んでいる側を DELETE） | ○ |
-| ⑨ | 代替案：全件同期 MERGE（公開テーブルを作り直さない） | ○ |
-| ⑩ | 代替案：差分更新 MERGE × 通常の長時間 SELECT | ○ |
+| ⑧ | 本命：制御テーブル切替 + 低優先度 SWITCH で退避（切替直後に後片付け、BatchSize = 0、2 回更新） | ○ |
+| ⑨ | 比較：制御テーブル切替 + DELETE（ログ量の比較用） | ○ |
+| ⑩ | 代替案：全件同期 MERGE（公開テーブルを作り直さない） | ○ |
+| ⑪ | 代替案：差分更新 MERGE × 通常の長時間 SELECT | ○ |
 
 ### 参考：SQL Server 2022（Docker・30 万行）での実行結果
 
@@ -86,6 +99,14 @@ DDL（DROP / ALTER VIEW / SWITCH）が必要とする Sch-M ロックには効�
 | SWITCH（低優先度・読取1 が 120 秒） | ON | 1 分で切替を中止（エラー 1222） | なし |
 | 制御テーブル切替 × 2 回更新 | OFF | 成功。ただし 2 回目の DELETE が読取1 を約 36 秒待機（LCK_M_X） | なし |
 | 制御テーブル切替 × 2 回更新 | ON | 待機なしで成功 | なし |
+
+ログ量（SIMPLE・RCSI ON・30 万行 ≒ 270MB・2 回更新の合計）：
+
+| 方式 | ログ書込量 | ログファイル | 補足 |
+| --- | --- | --- | --- |
+| ⑨ 制御テーブル切替 + DELETE | 601 MB | 136 → 648 MB に膨張 | DELETE 284MB + DELETE 後の BulkCopy 289MB |
+| ⑧ 本命（BatchSize = 10,000） | 57 MB | 72 → 136 MB | BulkCopy 約 28MB / 回 |
+| ⑧ 本命（BatchSize = 0） | 4.4 MB | 増えず | BulkCopy 約 2.2MB / 回。後片付けは読取1 の終了を約 50 秒待機（公開・読み取りへの影響なし） |
 | 全件同期 MERGE（約 6 万行 UPDATE） | ON | 待機なしで成功（MERGE 約 1.5 秒） | なし |
 | 差分更新 MERGE | ON | 待機なしで成功 | なし |
 

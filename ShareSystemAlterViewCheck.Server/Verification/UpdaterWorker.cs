@@ -70,13 +70,15 @@ public sealed class UpdaterWorker(RunContext ctx, string connectionString, RunRe
         var total = Stopwatch.StartNew();
         ctx.Info(Actor, $"{label}開始: {ModeText(req.Mode)} / {UpdateTypeText(req.UpdateType)}");
 
+        await using var conn = new SqlConnection(connectionString);
+        long? logStart = null;
         try
         {
-            await using var conn = new SqlConnection(connectionString);
             await conn.OpenAsync(ct);
             var spid = await ReaderWorker.GetSpidAsync(conn, ct);
             using var session = ctx.Track(spid, Actor);
             ctx.Info(Actor, $"接続しました SPID={spid}");
+            logStart = await LogBytesAsync(conn, ct);
 
             switch (req.UpdateType, req.Mode)
             {
@@ -105,6 +107,13 @@ public sealed class UpdaterWorker(RunContext ctx, string connectionString, RunRe
             result.TotalMs = total.ElapsedMilliseconds;
             ctx.Success(Actor, $"{label}完了: 合計 {result.TotalMs:N0}ms（切替/反映 {result.SwitchMs:N0}ms）");
         }
+        catch (UpdateSkippedException ex)
+        {
+            result.TotalMs = total.ElapsedMilliseconds;
+            result.Error = ex.InnerException?.Message;
+            result.Result = $"見送り（{ex.Message}）";
+            ctx.Warn(Actor, $"{label}を見送りました: {ex.Message}（公開中のデータはそのまま。次回の更新でやり直します）");
+        }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
             result.Result = "キャンセル";
@@ -131,6 +140,85 @@ public sealed class UpdaterWorker(RunContext ctx, string connectionString, RunRe
             result.Result = "エラー";
             ctx.Error(Actor, $"{label}失敗: {ex.Message}", ex.ToString());
         }
+        finally
+        {
+            await RecordTotalLogAsync(conn, result, label, logStart);
+        }
+    }
+
+    /// <summary>更新 1 回分のログ書込量を記録する。準備段階は「合計 − BulkCopy − 切替 − 後片付け」で求める</summary>
+    private async Task RecordTotalLogAsync(SqlConnection conn, UpdateResult result, string label, long? logStart)
+    {
+        if (logStart is null || conn.State != System.Data.ConnectionState.Open)
+        {
+            return;
+        }
+        try
+        {
+            result.TotalLogMb = LogMb(logStart, await LogBytesAsync(conn, CancellationToken.None));
+            if (result.TotalLogMb is double total)
+            {
+                var others = (result.BulkCopyLogMb ?? 0) + (result.SwitchLogMb ?? 0) + (result.CleanupLogMb ?? 0);
+                result.PrepareLogMb = Math.Round(Math.Max(0, total - others), 1);
+                ctx.Info(Actor, $"{label}のログ書込量: 合計 {total:N1} MB（準備 {result.PrepareLogMb:N1} / BulkCopy {result.BulkCopyLogMb ?? 0:N1} / 切替 {result.SwitchLogMb ?? 0:N1} / 後片付け {result.CleanupLogMb ?? 0:N1}）");
+            }
+        }
+        catch
+        {
+            // ログ量の取得に失敗しても検証結果には影響させない
+        }
+    }
+
+    /// <summary>ログファイルの累計書込バイト数（VIEW SERVER STATE がない場合は null）</summary>
+    private static async Task<long?> LogBytesAsync(SqlConnection conn, CancellationToken ct) =>
+        (await DbObjects.GetLogStatsAsync(conn, ct)).BytesWritten;
+
+    private static double? LogMb(long? before, long? after) =>
+        before is long b && after is long a ? Math.Round(Math.Max(0, a - b) / 1048576.0, 1) : null;
+
+    private string LowPrioritySql() =>
+        $" WITH (WAIT_AT_LOW_PRIORITY (MAX_DURATION = {req.LowPriorityMaxMinutes} MINUTES, ABORT_AFTER_WAIT = {req.LowPriorityAbort.ToString().ToUpperInvariant()}))";
+
+    /// <summary>低優先度の待機中に CommandTimeout で打ち切られないよう、待機時間 + 30 秒は待つ</summary>
+    private int? LowPriorityTimeout() =>
+        req.CommandTimeoutSec > 0 && req.CommandTimeoutSec < req.LowPriorityMaxMinutes * 60 + 30
+            ? req.LowPriorityMaxMinutes * 60 + 30
+            : null;
+
+    /// <summary>テーブルを空にする SQL（InactivePrep に従う）</summary>
+    private string EmptyTableSql(string table)
+    {
+        var q = DbObjects.Q(table);
+        var trash = DbObjects.Q(DbObjects.CtlTrash);
+        return req.InactivePrep switch
+        {
+            InactivePrep.Truncate => $"{LockTimeoutSql()}TRUNCATE TABLE {q};",
+            InactivePrep.Delete => $"{LockTimeoutSql()}DELETE FROM {q};",
+            // 退避用は読み取りから参照されないので TRUNCATE で止まらない。SWITCH はメタデータ操作だけでログはほぼ出ない
+            InactivePrep.SwitchOut => $"""
+                TRUNCATE TABLE {trash};
+                ALTER TABLE {q} SWITCH TO {trash}{LowPrioritySql()};
+                TRUNCATE TABLE {trash};
+                """,
+            _ => $"""
+                 {LockTimeoutSql()}IF OBJECT_ID(N'{q}', N'U') IS NOT NULL DROP TABLE {q};
+                 {DbObjects.CreateDataTableSql(table)}
+                 """,
+        };
+    }
+
+    private static string PrepText(InactivePrep prep) => prep switch
+    {
+        InactivePrep.Truncate => "TRUNCATE",
+        InactivePrep.Delete => "DELETE",
+        InactivePrep.SwitchOut => "低優先度 SWITCH で退避 + TRUNCATE",
+        _ => "DROP + CREATE",
+    };
+
+    private static async Task<bool> HasRowsAsync(SqlConnection conn, string table, CancellationToken ct)
+    {
+        await using var cmd = new SqlCommand($"SELECT CASE WHEN EXISTS (SELECT 1 FROM {DbObjects.Q(table)}) THEN 1 ELSE 0 END", conn);
+        return (int)(await cmd.ExecuteScalarAsync(ct))! == 1;
     }
 
     // ===== 全件更新：テーブル公開（現行方式） =====
@@ -196,17 +284,26 @@ public sealed class UpdaterWorker(RunContext ctx, string connectionString, RunRe
         result.ToTable = inactive;
         ctx.Info(Actor, $"現在のアクティブ: {active} → 更新対象（非アクティブ）: {inactive}");
 
-        var q = DbObjects.Q(inactive);
-        var prepareSql = req.InactivePrep switch
+        if (req.Mode == PublishMode.Control && !await HasRowsAsync(conn, inactive, ct))
         {
-            InactivePrep.Truncate => $"{LockTimeoutSql()}TRUNCATE TABLE {q};",
-            InactivePrep.Delete => $"{LockTimeoutSql()}DELETE FROM {q};",
-            _ => $"""
-                 {LockTimeoutSql()}IF OBJECT_ID(N'{q}', N'U') IS NOT NULL DROP TABLE {q};
-                 {DbObjects.CreateDataTableSql(inactive)}
-                 """,
-        };
-        result.PrepareMs = await ExecPhaseAsync(conn, $"{label}: 非アクティブ側を空にする ({req.InactivePrep})", prepareSql, ct, isSwitch: true);
+            // 前回の切替の直後に空にしてあれば、ここでは何もしない
+            ctx.Info(Actor, $"非アクティブ側 {inactive} は既に空なので、空にする処理を省略します");
+            result.PrepareMs = 0;
+        }
+        else
+        {
+            var name = $"{label}: 非アクティブ側を空にする（{PrepText(req.InactivePrep)}）";
+            try
+            {
+                result.PrepareMs = await ExecPhaseAsync(conn, name, EmptyTableSql(inactive), ct, isSwitch: true,
+                    req.InactivePrep == InactivePrep.SwitchOut ? LowPriorityTimeout() : null);
+            }
+            catch (SqlException ex) when (req.InactivePrep == InactivePrep.SwitchOut && ex.Number is 1222 or -2)
+            {
+                // 低優先度の待機時間切れ。DELETE に逃げるとログと時間がかかるので、今回の更新は見送る
+                throw new UpdateSkippedException("非アクティブ側を空にできず・低優先度の待機時間切れ", ex);
+            }
+        }
 
         result.RowsCopied = await BulkCopyPhaseAsync($"{label}: BulkCopy → {inactive}",
             $"SELECT {DbObjects.Columns} FROM {DbObjects.Q(DbObjects.Source)}", inactive, result, ct);
@@ -230,9 +327,7 @@ public sealed class UpdaterWorker(RunContext ctx, string connectionString, RunRe
             $"SELECT {DbObjects.Columns} FROM {DbObjects.Q(DbObjects.Source)}", DbObjects.SwStage, result, ct);
 
         // 公開テーブル → 退避先、投入先 → 公開テーブルの順に SWITCH（どちらもメタデータ操作のみで一瞬）
-        var lowPriority = req.SwitchLowPriority
-            ? $" WITH (WAIT_AT_LOW_PRIORITY (MAX_DURATION = {req.LowPriorityMaxMinutes} MINUTES, ABORT_AFTER_WAIT = {req.LowPriorityAbort.ToString().ToUpperInvariant()}))"
-            : "";
+        var lowPriority = req.SwitchLowPriority ? LowPrioritySql() : "";
         var switchSql = $"""
             {LockTimeoutSql()}SET XACT_ABORT ON;
             BEGIN TRAN;
@@ -255,11 +350,45 @@ public sealed class UpdaterWorker(RunContext ctx, string connectionString, RunRe
     // ===== 全件更新：制御テーブル切替（代替案） =====
     private async Task FullControlAsync(SqlConnection conn, UpdateResult result, string label, CancellationToken ct)
     {
-        var (_, inactive) = await PrepareInactiveAsync(conn, result, label, ct);
+        var (active, inactive) = await PrepareInactiveAsync(conn, result, label, ct);
         var side = inactive == DbObjects.CtlA ? "A" : "B";
         // ビュー定義は変えず、制御テーブルの値（DML）だけで参照先を切り替える
         var switchSql = $"{LockTimeoutSql()}UPDATE {DbObjects.Q(DbObjects.CtlActive)} SET ActiveSide = '{side}' WHERE Id = 1;";
         result.SwitchMs = await SwitchPhaseAsync(conn, result, $"{label}: 切替 UPDATE 制御テーブル → {inactive}", switchSql, ct);
+
+        if (req.CleanupAfterSwitch)
+        {
+            await CleanupAsync(conn, result, label, active, ct);
+        }
+    }
+
+    /// <summary>
+    /// 切替の直後に旧側を空にしておく。旧側を読んでいる古い読み取りが終わるまで待つが、公開（切替）は済んでいる。
+    /// 待ちきれなかった場合はエラーにせず、次回の更新時にもう一度空にする。
+    /// </summary>
+    private async Task CleanupAsync(SqlConnection conn, UpdateResult result, string label, string oldTable, CancellationToken ct)
+    {
+        result.CleanupStartMs = ctx.ElapsedMs;
+        var before = await LogBytesAsync(conn, ct);
+        try
+        {
+            result.CleanupMs = await ExecPhaseAsync(conn, $"{label}: 後片付け 旧側 {oldTable} を空にする（{PrepText(req.InactivePrep)}）",
+                EmptyTableSql(oldTable), ct, isSwitch: true, req.InactivePrep == InactivePrep.SwitchOut ? LowPriorityTimeout() : null);
+            result.CleanupResult = "完了";
+        }
+        catch (SqlException ex) when (ex.Number is 1222 or -2)
+        {
+            result.CleanupResult = "時間切れ（次回の更新時に空にします）";
+            ctx.Warn(Actor, $"{label}: 旧側 {oldTable} を空にできませんでした（待機時間切れ）。公開には影響ありません。次回の更新時にもう一度空にします");
+        }
+        finally
+        {
+            result.CleanupEndMs = ctx.ElapsedMs;
+            if (conn.State == System.Data.ConnectionState.Open && !ct.IsCancellationRequested)
+            {
+                result.CleanupLogMb = LogMb(before, await LogBytesAsync(conn, CancellationToken.None));
+            }
+        }
     }
 
     // ===== 全件同期（テーブルを作り直さず MERGE で反映） =====
@@ -385,6 +514,7 @@ public sealed class UpdaterWorker(RunContext ctx, string connectionString, RunRe
             ctx.Info(Actor, "読み取りが実行中なので切替を実行します");
         }
 
+        var logBefore = await LogBytesAsync(conn, ct);
         ctx.ActiveSwitchIndex = result.Index;
         result.SwitchStartMs = ctx.ElapsedMs;
         try
@@ -397,7 +527,9 @@ public sealed class UpdaterWorker(RunContext ctx, string connectionString, RunRe
             {
                 ctx.Warn(Actor, "切替が 3 秒以上終わらないため、ロック待機中とみなします（ロック監視では未検出）");
             }
-            return await exec;
+            var switchMs = await exec;
+            result.SwitchLogMb = LogMb(logBefore, await LogBytesAsync(conn, ct));
+            return switchMs;
         }
         finally
         {
@@ -476,19 +608,25 @@ public sealed class UpdaterWorker(RunContext ctx, string connectionString, RunRe
             using var bulk = new SqlBulkCopy(dest, SqlBulkCopyOptions.TableLock, null)
             {
                 DestinationTableName = DbObjects.Q(destination),
-                BatchSize = 10_000,
+                BatchSize = req.BulkBatchSize,
                 BulkCopyTimeout = 600,
                 EnableStreaming = true,
                 NotifyAfter = 50_000,
             };
             long copied = 0;
             bulk.SqlRowsCopied += (_, e) => copied = e.RowsCopied;
+            var logBefore = await LogBytesAsync(dest, ct);
             await bulk.WriteToServerAsync(reader, ct);
             copied = Math.Max(copied, bulk.RowsCopied);
 
             var ms = ctx.EndPhase(phase);
             result.BulkCopyMs = (result.BulkCopyMs ?? 0) + ms;
-            ctx.Info(Actor, $"{name} 完了（{copied:N0}行 / {sw.ElapsedMilliseconds:N0}ms）");
+            var logMb = LogMb(logBefore, await LogBytesAsync(dest, ct));
+            if (logMb is double mb)
+            {
+                result.BulkCopyLogMb = (result.BulkCopyLogMb ?? 0) + mb;
+            }
+            ctx.Info(Actor, $"{name} 完了（{copied:N0}行 / {sw.ElapsedMilliseconds:N0}ms{(logMb is null ? "" : $" / ログ {logMb:N1} MB")}）");
             return copied;
         }
         catch (SqlException ex)
@@ -537,3 +675,6 @@ public sealed class UpdaterWorker(RunContext ctx, string connectionString, RunRe
         _ => type.ToString(),
     };
 }
+
+/// <summary>更新を見送った（公開中のデータはそのまま）。エラーではなく、次回の更新でやり直す扱い</summary>
+public sealed class UpdateSkippedException(string message, Exception? inner = null) : Exception(message, inner);

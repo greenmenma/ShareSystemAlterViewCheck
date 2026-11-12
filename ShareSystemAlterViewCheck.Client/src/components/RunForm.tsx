@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { api } from '../api';
-import { lowPriorityAbortLabel, modeLabel, readerKindLabel, readerTriggerLabel, updateTypeLabel } from '../format';
+import { inactivePrepLabel, lowPriorityAbortLabel, modeLabel, readerKindLabel, readerTriggerLabel, updateTypeLabel } from '../format';
 import type { EnvironmentStatus, InactivePrep, LowPriorityAbort, PublishMode, ReaderKind, ReaderSpec, ReaderTrigger, RunRequest, UpdateType } from '../types';
 
 interface Preset {
@@ -36,6 +36,7 @@ const base: RunRequest = {
     inactivePrep: 'Truncate',
     diffRowCount: 1000,
     monitorIntervalMs: 500,
+    bulkBatchSize: 10000,
     switchLowPriority: true,
     lowPriorityMaxMinutes: 1,
     lowPriorityAbort: 'Self',
@@ -138,15 +139,36 @@ const presets: Preset[] = [
     {
         key: 'control',
         group: 'alternative',
-        title: '⑧ 制御テーブル切替（DDL なし）',
-        expect: '解消見込み',
+        title: '⑧ 本命：制御テーブル切替 + 低ログ',
+        expect: '解消見込み・ログ最小',
         expectLevel: 'success',
         needsRcsi: true,
         description:
-            'ビュー定義は固定し、制御テーブルの値（UPDATE）で A/B を切り替えます。DDL を使わないので Sch-M ロックが発生しません。2 回目の更新では読取1 が読んでいる側を DELETE して入れ替えます（RCSI なら読取1 は更新前の行を読み続けます）。',
+            'ビュー定義は固定し、制御テーブルの UPDATE で A/B を切り替えます（DDL なし）。切替の直後に旧側を低優先度 SWITCH で退避して TRUNCATE するので、DELETE を使わずログはほぼ出ません（SIMPLE なら BulkCopy も最小ログ。BatchSize=0 で全件を 1 バッチにすると最小になります）。後片付けは古い読み取りの終了を待ちますが、公開と後から来た読み取りには影響しません。',
         request: {
             ...base,
-            title: '⑧ 代替: 制御テーブル切替 × 長時間SELECT × 2回更新',
+            title: '⑧ 本命: 制御テーブル切替 + SWITCH 退避 × 長時間SELECT × 2回更新',
+            mode: 'Control',
+            inactivePrep: 'SwitchOut',
+            cleanupAfterSwitch: true,
+            bulkBatchSize: 0,
+            lowPriorityMaxMinutes: 2,
+            updateCount: 2,
+            updateIntervalSec: 30,
+        },
+    },
+    {
+        key: 'control-delete',
+        group: 'alternative',
+        title: '⑨ 比較：制御テーブル切替 + DELETE',
+        expect: 'ログが多い',
+        expectLevel: 'warn',
+        needsRcsi: true,
+        description:
+            '⑧と同じ切替で、非アクティブ側を DELETE で空にする場合。全行がログに書かれるため、⑧とログ書込量・時間を比べられます。2 回目の更新では読取1 が読んでいる側を DELETE します。',
+        request: {
+            ...base,
+            title: '⑨ 比較: 制御テーブル切替 + DELETE × 長時間SELECT × 2回更新',
             mode: 'Control',
             inactivePrep: 'Delete',
             updateCount: 2,
@@ -156,24 +178,24 @@ const presets: Preset[] = [
     {
         key: 'fullsync',
         group: 'alternative',
-        title: '⑨ 全件同期 MERGE（作り直さない）',
+        title: '⑩ 全件同期 MERGE（作り直さない）',
         expect: '解消見込み',
         expectLevel: 'success',
         needsRcsi: true,
         description:
             '公開テーブルを作り直さず、全件をステージングへ取得して MERGE（変わった行の UPDATE・INSERT・DELETE）で反映します。DDL がないので Sch-M は不要。RCSI なら読み取りは更新前の行を読み、MERGE と互いに待ちません。',
-        request: { ...base, title: '⑨ 代替: 全件同期 MERGE × 長時間SELECT', mode: 'Table', updateType: 'FullSync' },
+        request: { ...base, title: '⑩ 代替: 全件同期 MERGE × 長時間SELECT', mode: 'Table', updateType: 'FullSync' },
     },
     {
         key: 'diff-rcsi',
         group: 'alternative',
-        title: '⑩ 差分更新 MERGE × 通常の SELECT',
+        title: '⑪ 差分更新 MERGE × 通常の SELECT',
         expect: '解消見込み',
         expectLevel: 'success',
         needsRcsi: true,
         description:
             '差分更新（MERGE）中に通常の長時間 SELECT を実行。RCSI が ON なら待機なし、OFF なら MERGE と読み取りの S ロックが待ち合うことを比較できます。',
-        request: { ...base, title: '⑩ 代替: 差分更新 MERGE × 長時間SELECT', mode: 'Table', updateType: 'Diff' },
+        request: { ...base, title: '⑪ 代替: 差分更新 MERGE × 長時間SELECT', mode: 'Table', updateType: 'Diff' },
     },
 ];
 
@@ -210,6 +232,9 @@ export default function RunForm({ env, onStarted }: Props) {
 
     const blueGreen = ['View', 'Synonym', 'Control'].includes(req.mode) && req.updateType === 'Full';
     const switchFull = req.mode === 'Switch' && req.updateType === 'Full';
+    const controlFull = req.mode === 'Control' && req.updateType === 'Full';
+    // 低優先度の設定は、SWITCH 方式と「SWITCH で退避」の両方で使う
+    const lowPriorityUsed = (switchFull && req.switchLowPriority !== false) || (blueGreen && req.inactivePrep === 'SwitchOut');
     const needsRcsi = req.mode === 'Control' || req.updateType === 'FullSync' || req.updateType === 'Diff';
     const rcsi = env?.readCommittedSnapshot;
     const totalSec = Math.max(
@@ -325,9 +350,22 @@ export default function RunForm({ env, onStarted }: Props) {
                         非アクティブ側の準備
                         <select value={req.inactivePrep} disabled={!blueGreen}
                             onChange={(e) => set('inactivePrep', e.target.value as InactivePrep)}>
-                            <option value="Truncate">TRUNCATE TABLE</option>
-                            <option value="DropCreate">DROP + CREATE TABLE</option>
-                            <option value="Delete">DELETE FROM</option>
+                            {(Object.keys(inactivePrepLabel) as InactivePrep[]).map((k) => (
+                                <option key={k} value={k}>{inactivePrepLabel[k]}</option>
+                            ))}
+                        </select>
+                    </label>
+                    <label>
+                        BulkCopy の BatchSize（0=全件 1 バッチ）
+                        <input type="number" min={0} step={10000} value={req.bulkBatchSize ?? 10000}
+                            onChange={(e) => set('bulkBatchSize', Number(e.target.value))} />
+                    </label>
+                    <label>
+                        切替後の後片付け
+                        <select value={req.cleanupAfterSwitch ? 'on' : 'off'} disabled={!controlFull}
+                            onChange={(e) => set('cleanupAfterSwitch', e.target.value === 'on')}>
+                            <option value="on">切替の直後に旧側を空にする</option>
+                            <option value="off">しない（次回の更新時に空にする）</option>
                         </select>
                     </label>
                     <label>
@@ -341,12 +379,12 @@ export default function RunForm({ env, onStarted }: Props) {
                     <label>
                         低優先度の最大待機（分）
                         <input type="number" min={1} max={60} value={req.lowPriorityMaxMinutes ?? 1}
-                            disabled={!switchFull || req.switchLowPriority === false}
+                            disabled={!lowPriorityUsed}
                             onChange={(e) => set('lowPriorityMaxMinutes', Number(e.target.value))} />
                     </label>
                     <label>
                         待機時間を過ぎたら（ABORT_AFTER_WAIT）
-                        <select value={req.lowPriorityAbort ?? 'Self'} disabled={!switchFull || req.switchLowPriority === false}
+                        <select value={req.lowPriorityAbort ?? 'Self'} disabled={!lowPriorityUsed}
                             onChange={(e) => set('lowPriorityAbort', e.target.value as LowPriorityAbort)}>
                             {(Object.keys(lowPriorityAbortLabel) as LowPriorityAbort[]).map((k) => (
                                 <option key={k} value={k}>{lowPriorityAbortLabel[k]}</option>
@@ -495,13 +533,14 @@ export default function RunForm({ env, onStarted }: Props) {
                     <div>
                         <h4>代替案：制御テーブル切替（DDL なし）</h4>
                         <ol>
-                            <li>非アクティブ側（A/B）を DELETE で空にする</li>
-                            <li>vt_Source から BulkCopy</li>
-                            <li><code>UPDATE vt_CtlActive SET ActiveSide = 'B'</code></li>
+                            <li>空の非アクティブ側（例：B）へ vt_Source から BulkCopy（SIMPLE なら最小ログ）</li>
+                            <li><code>UPDATE vt_CtlActive SET ActiveSide = 'B'</code>（公開はここで一瞬で切り替わる）</li>
+                            <li>旧側 A を <code>ALTER TABLE vt_Ctl_A SWITCH TO vt_Ctl_Trash WITH (WAIT_AT_LOW_PRIORITY …)</code> で退避し、<code>TRUNCATE TABLE vt_Ctl_Trash</code></li>
                         </ol>
                         <p>
-                            ビュー vt_CtlView は制御テーブルの値で A/B の片側だけを読む固定定義です。切替は DML なので Sch-M が不要。
-                            非アクティブ側を TRUNCATE すると Sch-M が必要になるため DELETE を使います。RCSI 前提です。
+                            ビュー vt_CtlView は制御テーブルの値で A/B の片側だけを読む固定定義です。切替は DML なので Sch-M が不要。RCSI 前提です。
+                            ビューを読む SELECT は A・B 両方に Sch-S を持つため、旧側をすぐ TRUNCATE することはできません。
+                            低優先度 SWITCH なら古い読み取りの終了を待つ間も、後から来た読み取りを止めません。DELETE は全行がログに書かれるため使いません。
                         </p>
                     </div>
                     <div>

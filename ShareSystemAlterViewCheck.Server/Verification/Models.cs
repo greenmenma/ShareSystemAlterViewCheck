@@ -67,6 +67,8 @@ public enum InactivePrep
     Truncate,
     DropCreate,
     Delete,
+    /// <summary>低優先度の SWITCH で退避用テーブルへ移してから TRUNCATE（ログほぼなし。読み取りの終了は待つが、後から来た読み取りは止めない）</summary>
+    SwitchOut,
 }
 
 public enum RunStatus
@@ -132,6 +134,12 @@ public sealed class RunRequest
     /// <summary>差分更新の件数（半分を更新、半分を追加）</summary>
     public int DiffRowCount { get; set; } = 1000;
 
+    /// <summary>SqlBulkCopy の BatchSize（0 = 全件を 1 バッチで投入）</summary>
+    public int BulkBatchSize { get; set; } = 10_000;
+
+    /// <summary>制御テーブル切替：切替の直後に旧側（それまでの公開側）を空にしておく（次回の更新で空にする手間を先に済ませる）</summary>
+    public bool CleanupAfterSwitch { get; set; }
+
     /// <summary>SWITCH 方式：WAIT_AT_LOW_PRIORITY を付けるか</summary>
     public bool SwitchLowPriority { get; set; } = true;
 
@@ -195,6 +203,19 @@ public sealed class UpdateResult
     public long? SwitchStartMs { get; set; }
     public long? SwitchEndMs { get; set; }
 
+    /// <summary>切替直後の旧側の後片付け（CleanupAfterSwitch）</summary>
+    public long? CleanupMs { get; set; }
+    public long? CleanupStartMs { get; set; }
+    public long? CleanupEndMs { get; set; }
+    public string? CleanupResult { get; set; }
+
+    /// <summary>各段階でトランザクションログに書かれた量（MB）。権限がない場合は null</summary>
+    public double? PrepareLogMb { get; set; }
+    public double? BulkCopyLogMb { get; set; }
+    public double? SwitchLogMb { get; set; }
+    public double? CleanupLogMb { get; set; }
+    public double? TotalLogMb { get; set; }
+
     public long RowsCopied { get; set; }
     public string? FromTable { get; set; }
     public string? ToTable { get; set; }
@@ -243,6 +264,12 @@ public sealed class RunSummary
     public int ReaderBlockCount { get; set; }
     public long ReaderMaxBlockedMs { get; set; }
 
+    /// <summary>切替直後の後片付けでのロック待機（公開には影響しない待機）</summary>
+    public long CleanupMaxBlockedMs { get; set; }
+
+    /// <summary>検証中にトランザクションログへ書かれた合計（MB）</summary>
+    public double? TotalLogMb { get; set; }
+
     public List<UpdateResult> Updates { get; set; } = [];
     public List<ReaderResult> Readers { get; set; } = [];
 }
@@ -261,6 +288,13 @@ public sealed class RunRecord
 
     /// <summary>検証開始時の READ_COMMITTED_SNAPSHOT（RCSI）の設定</summary>
     public bool? ReadCommittedSnapshot { get; set; }
+
+    /// <summary>復旧モデル（SIMPLE / FULL / BULK_LOGGED）</summary>
+    public string? RecoveryModel { get; set; }
+
+    /// <summary>ログファイルのサイズ（MB）。検証の開始時と終了時</summary>
+    public double? LogFileStartMb { get; set; }
+    public double? LogFileEndMb { get; set; }
 
     public List<RunEvent> Events { get; set; } = [];
     public List<RunPhase> Phases { get; set; } = [];
@@ -327,6 +361,9 @@ public sealed class EnvironmentStatus
 
     /// <summary>READ_COMMITTED_SNAPSHOT（RCSI）が ON か</summary>
     public bool? ReadCommittedSnapshot { get; set; }
+
+    public string? RecoveryModel { get; set; }
+    public double? LogFileMb { get; set; }
 
     /// <summary>ALTER DATABASE の権限があるか（RCSI の切替に必要）</summary>
     public bool CanAlterDatabase { get; set; }

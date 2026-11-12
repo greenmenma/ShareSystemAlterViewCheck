@@ -25,7 +25,8 @@ public sealed class SetupService(RunManager manager)
         (DbObjects.CtlView, "代替案 制御テーブル切替：公開ビュー（定義は固定）"),
         (DbObjects.CtlActive, "代替案 制御テーブル切替：参照先を示す制御テーブル"),
         (DbObjects.CtlA, "代替案 制御テーブル切替：A テーブル"),
-        (DbObjects.CtlB, "代替案 制御テーブル切替：B テーブル"),
+        (DbObjects.CtlB, "代替案 制御テーブル切替：B テーブル（初期は空）"),
+        (DbObjects.CtlTrash, "代替案 制御テーブル切替：空にするときの退避用（読み取りから参照されない）"),
         (DbObjects.DiffStage, "差分更新・全件同期のステージング（一時）"),
     ];
 
@@ -81,6 +82,8 @@ public sealed class SetupService(RunManager manager)
                 }
             }
             status.ReadCommittedSnapshot = await DbObjects.GetReadCommittedSnapshotAsync(conn, ct);
+            status.RecoveryModel = await DbObjects.GetRecoveryModelAsync(conn, ct);
+            status.LogFileMb = (await DbObjects.GetLogStatsAsync(conn, ct)).SizeMb;
 
             foreach (var (name, role) in Catalog)
             {
@@ -174,7 +177,7 @@ public sealed class SetupService(RunManager manager)
             foreach (var table in new[]
                      {
                          DbObjects.PublicTable, DbObjects.ViewBlue, DbObjects.ViewGreen, DbObjects.SynBlue, DbObjects.SynGreen,
-                         DbObjects.SwPublic, DbObjects.CtlA, DbObjects.CtlB,
+                         DbObjects.SwPublic, DbObjects.CtlA,
                      })
             {
                 await ExecAsync(ctx, conn, $"{table} 作成・データ投入", $"""
@@ -191,6 +194,9 @@ public sealed class SetupService(RunManager manager)
             await ExecAsync(ctx, conn, "SWITCH 方式の投入先・退避先テーブル作成",
                 DbObjects.CreateDataTableSql(DbObjects.SwStage) + "\n" + DbObjects.CreateDataTableSql(DbObjects.SwOld), ct);
 
+            // 制御テーブル切替：A を公開中、B と退避用は空（本番の運用と同じ初期状態）
+            await ExecAsync(ctx, conn, "制御テーブル切替の B・退避用テーブル作成（空）",
+                DbObjects.CreateDataTableSql(DbObjects.CtlB) + "\n" + DbObjects.CreateDataTableSql(DbObjects.CtlTrash), ct);
             await ExecAsync(ctx, conn, "制御テーブル作成（→ A）", DbObjects.CreateCtlActiveSql(), ct);
             await ExecAsync(ctx, conn, "制御テーブル切替の公開ビュー作成", DbObjects.CreateCtlViewSql(), ct);
 
@@ -300,7 +306,7 @@ public sealed class SetupService(RunManager manager)
         {
             DbObjects.PublicTable, DbObjects.PublicTableNew, DbObjects.ViewBlue, DbObjects.ViewGreen,
             DbObjects.SynBlue, DbObjects.SynGreen, DbObjects.DiffStage, DbObjects.Source,
-            DbObjects.SwPublic, DbObjects.SwStage, DbObjects.SwOld, DbObjects.CtlActive, DbObjects.CtlA, DbObjects.CtlB,
+            DbObjects.SwPublic, DbObjects.SwStage, DbObjects.SwOld, DbObjects.CtlActive, DbObjects.CtlA, DbObjects.CtlB, DbObjects.CtlTrash,
         }.Select(t => $"IF OBJECT_ID(N'{DbObjects.Q(t)}', N'U') IS NOT NULL DROP TABLE {DbObjects.Q(t)};"))}
         """;
 
