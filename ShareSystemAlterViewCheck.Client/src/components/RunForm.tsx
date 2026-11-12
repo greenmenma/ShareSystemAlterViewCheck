@@ -13,10 +13,10 @@ interface Preset {
 }
 
 // 検証したいパターン：
-//   読取1 が切替の直前から読み続ける → 切替（DROP/ALTER）がロック待機 → 待機中に読取2 が新たに SELECT
+//   読取1 が切替の 10 秒前から読み続ける → 切替（DROP/ALTER）がロック待機 → 待機中に読取2 が新たに SELECT
 // 開始タイミングは更新処理のイベントに連動するので、BulkCopy の速さに関係なく必ずこの順序になる
 const blockingReaders: ReaderSpec[] = [
-    { kind: 'SlowRead', trigger: 'BeforeSwitch', triggerUpdate: 1, startDelaySec: 0, durationSec: 60 },
+    { kind: 'SlowRead', trigger: 'BeforeSwitch', triggerUpdate: 1, startDelaySec: 10, durationSec: 60 },
     { kind: 'SlowRead', trigger: 'SwitchBlocked', triggerUpdate: 1, startDelaySec: 5, durationSec: 10 },
 ];
 
@@ -41,7 +41,7 @@ const presets: Preset[] = [
         expect: 'タイムアウト想定',
         expectLevel: 'error',
         description:
-            '読取1 が切替の直前から公開テーブルを 60 秒読み続け、DROP TABLE がロック待機（LCK_M_SCH_M）。待機になって 5 秒後に読取2 が新たに SELECT し、読取2 も DROP の後ろで待たされる（LCK_M_SCH_S）ことと、CommandTimeout(30秒) で更新が失敗する現象を再現します。',
+            '読取1 が切替の 10 秒前から公開テーブルを 60 秒読み続け、DROP TABLE がロック待機（LCK_M_SCH_M）。待機になって 5 秒後に読取2 が新たに SELECT し、読取2 も DROP の後ろで待たされる（LCK_M_SCH_S）ことと、CommandTimeout(30秒) で更新が失敗する現象を再現します。',
         request: { ...base, title: '① 現行: テーブル公開 × 長時間SELECT', mode: 'Table' },
     },
     {
@@ -83,14 +83,14 @@ const presets: Preset[] = [
         expect: '待機の確認',
         expectLevel: 'warn',
         description:
-            'MERGE の直前から読取1 が HOLDLOCK でテーブルロックを 40 秒保持。MERGE のロック待機と、待機中に来た読取2 の待機を確認します。',
+            'MERGE の 10 秒前から読取1 が HOLDLOCK でテーブルロックを 40 秒保持。MERGE のロック待機と、待機中に来た読取2 の待機を確認します。',
         request: {
             ...base,
             title: '⑤ 差分更新 × HOLDLOCK',
             mode: 'Table',
             updateType: 'Diff',
             readers: [
-                { kind: 'HoldLock', trigger: 'BeforeSwitch', triggerUpdate: 1, startDelaySec: 0, durationSec: 40 },
+                { kind: 'HoldLock', trigger: 'BeforeSwitch', triggerUpdate: 1, startDelaySec: 10, durationSec: 40 },
                 { kind: 'SlowRead', trigger: 'SwitchBlocked', triggerUpdate: 1, startDelaySec: 5, durationSec: 10 },
             ],
         },
@@ -285,12 +285,17 @@ export default function RunForm({ env, onStarted }: Props) {
                                                 onChange={(e) => updateReader(i, { triggerUpdate: Number(e.target.value) })} />
                                         </td>
                                         <td>
-                                            <input type="number" min={0} value={r.startDelaySec} disabled={trigger === 'BeforeSwitch'}
+                                            <input type="number" min={0} value={r.startDelaySec}
                                                 onChange={(e) => updateReader(i, { startDelaySec: Number(e.target.value) })} />
                                         </td>
                                         <td>
                                             <input type="number" min={1} value={r.durationSec}
                                                 onChange={(e) => updateReader(i, { durationSec: Number(e.target.value) })} />
+                                            {trigger === 'BeforeSwitch' && r.startDelaySec >= r.durationSec && (
+                                                <div className="hint" style={{ color: 'var(--error)' }}>
+                                                    N が継続時間以上だと切替前に読み取りが終わります
+                                                </div>
+                                            )}
                                         </td>
                                         <td>
                                             <button className="btn btn-small" onClick={() => set('readers', req.readers.filter((_, j) => j !== i))}>
@@ -304,7 +309,7 @@ export default function RunForm({ env, onStarted }: Props) {
                     </table>
                 </div>
                 <p className="hint">
-                    「切替の直前」は、更新処理が BulkCopy を終えて切替 SQL を出す前に読み取りを開始し、読み取り中になったのを確認してから切替えます。
+                    「切替の N 秒前」は、更新処理が BulkCopy を終えたところで読み取りを開始し、読み取り中になったのを確認してから N 秒後に切替えます（N は継続時間より短くしてください。0 なら 0.5 秒後）。
                     「切替がロック待機になってから」は、ロック監視が切替の待機を検出してから N 秒後に開始します（検出できない場合は切替開始から 3 秒で待機中とみなします）。
                 </p>
                 <button className="btn btn-small" onClick={() =>

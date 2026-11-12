@@ -234,7 +234,7 @@ public sealed class UpdaterWorker(RunContext ctx, string connectionString, RunRe
 
     /// <summary>
     /// 切替（DROP+RENAME / ALTER VIEW / SYNONYM / MERGE）を実行する。
-    /// ・「切替直前」に開始する読み取りがあれば、読み取り中になるのを待ってから実行する
+    /// ・「切替の N 秒前」に開始する読み取りがあれば、読み取り中になってから N 秒待って実行する
     /// ・切替がロック待機になったら「切替待機中」に開始する読み取りへ通知する
     /// </summary>
     private async Task<long> SwitchPhaseAsync(SqlConnection conn, UpdateResult result, string name, string sql, CancellationToken ct)
@@ -246,6 +246,7 @@ public sealed class UpdaterWorker(RunContext ctx, string connectionString, RunRe
         if (readers.Count > 0)
         {
             var names = string.Join(", ", readers.Select(r => r.Actor));
+            var leadSec = readers.Max(r => r.LeadSec);
             var waitPhase = ctx.BeginPhase(Actor, $"読み取りの開始待ち（{names}）", "Wait");
             ctx.Info(Actor, $"切替の前に読み取り（{names}）が実行中になるのを待っています");
             try
@@ -258,9 +259,20 @@ public sealed class UpdaterWorker(RunContext ctx, string connectionString, RunRe
                 ctx.EndPhase(waitPhase, "Timeout");
                 ctx.Warn(Actor, "読み取りが 120 秒たっても開始しないため、そのまま切替を実行します");
             }
-            // 読み取り側が確実にロック（Sch-S / S）を保持している状態にしてから切替える
-            await Task.Delay(500, ct);
-            ctx.Info(Actor, "読み取りが実行中になったので切替を実行します");
+            // 読み取り側が確実にロック（Sch-S / S）を保持している状態にしてから切替える。
+            // 読み取り開始から N 秒（最低 0.5 秒）たってから切替えることで、「読み取りの途中で切替が来る」状況にする
+            if (leadSec > 0)
+            {
+                var leadPhase = ctx.BeginPhase(Actor, $"切替まで {leadSec} 秒待機（読み取り中）", "Wait");
+                ctx.Info(Actor, $"読み取りが実行中になりました。{leadSec} 秒後に切替を実行します");
+                await Task.Delay(TimeSpan.FromSeconds(leadSec), ct);
+                ctx.EndPhase(leadPhase);
+            }
+            else
+            {
+                await Task.Delay(500, ct);
+            }
+            ctx.Info(Actor, "読み取りが実行中なので切替を実行します");
         }
 
         ctx.ActiveSwitchIndex = result.Index;

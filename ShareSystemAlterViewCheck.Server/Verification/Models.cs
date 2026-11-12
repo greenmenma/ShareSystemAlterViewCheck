@@ -36,7 +36,7 @@ public enum ReaderTrigger
 {
     /// <summary>検証開始から StartDelaySec 秒後</summary>
     RunStart,
-    /// <summary>更新の切替（DROP+RENAME / ALTER VIEW 等）の直前。更新処理は読み取りが始まるのを待ってから切替を実行する</summary>
+    /// <summary>更新の切替（DROP+RENAME / ALTER VIEW 等）の N 秒前。更新処理は読み取りが始まってから StartDelaySec 秒待って切替を実行する</summary>
     BeforeSwitch,
     /// <summary>更新の切替がロック待機になってから StartDelaySec 秒後（待機中に後から来た SELECT を再現）</summary>
     SwitchBlocked,
@@ -76,7 +76,7 @@ public sealed class ReaderSpec
     /// <summary>トリガー対象の更新回（Trigger が BeforeSwitch / SwitchBlocked のとき。1 始まり）</summary>
     public int TriggerUpdate { get; set; } = 1;
 
-    /// <summary>開始遅延（秒）。RunStart は検証開始から、SwitchBlocked はロック待機の検出から。BeforeSwitch では使わない</summary>
+    /// <summary>開始遅延（秒）。RunStart は検証開始から、SwitchBlocked はロック待機の検出から。BeforeSwitch は読み取り開始から切替までの秒数</summary>
     public int StartDelaySec { get; set; }
 
     /// <summary>読み取りを続ける時間（秒）</summary>

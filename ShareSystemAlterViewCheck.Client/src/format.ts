@@ -25,7 +25,7 @@ export const readerKindLabel: Record<ReaderKind, string> = {
 
 export const readerTriggerLabel: Record<ReaderTrigger, string> = {
     RunStart: '検証開始から N 秒後',
-    BeforeSwitch: '切替の直前（更新は読み取り開始を待って切替）',
+    BeforeSwitch: '切替の N 秒前（更新は読み取り開始から N 秒後に切替）',
     SwitchBlocked: '切替がロック待機になってから N 秒後',
 };
 
@@ -34,7 +34,7 @@ export function readerWhen(r: ReaderSpec): string {
     const u = r.triggerUpdate ?? 1;
     switch (r.trigger ?? 'RunStart') {
         case 'BeforeSwitch':
-            return `更新${u}の切替直前に開始`;
+            return `更新${u}の切替${r.startDelaySec}秒前に開始`;
         case 'SwitchBlocked':
             return `更新${u}の切替がロック待機になって${r.startDelaySec}秒後に開始`;
         default:

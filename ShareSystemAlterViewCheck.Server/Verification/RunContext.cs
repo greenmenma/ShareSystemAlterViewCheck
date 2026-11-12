@@ -181,7 +181,7 @@ public sealed class RunContext
 /// 1 回の更新の切替に関するシグナル
 ///   Ready   : 更新処理が切替直前に到達した（false = 到達せず終了）
 ///   Blocked : 切替がロック待機になった（false = 待機せずに終わった / 切替に到達しなかった）
-///   ReadersStarted : 「切替直前」に開始する読み取りが、実際に読み取り中になったことの通知
+///   ReadersStarted : 「切替の N 秒前」に開始する読み取りが、実際に読み取り中になったことの通知
 /// </summary>
 public sealed class SwitchSignals(int index)
 {
@@ -191,20 +191,20 @@ public sealed class SwitchSignals(int index)
 
     public TaskCompletionSource<bool> Blocked { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-    private readonly List<(string Actor, TaskCompletionSource Started)> _readers = [];
+    private readonly List<(string Actor, int LeadSec, TaskCompletionSource Started)> _readers = [];
 
-    /// <summary>切替直前に開始する読み取りを登録する（検証開始前に呼ぶ）</summary>
-    public TaskCompletionSource RegisterBeforeSwitchReader(string actor)
+    /// <summary>切替前に開始する読み取りを登録する（検証開始前に呼ぶ）。leadSec = 読み取り開始から切替までの秒数</summary>
+    public TaskCompletionSource RegisterBeforeSwitchReader(string actor, int leadSec)
     {
         var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         lock (_readers)
         {
-            _readers.Add((actor, tcs));
+            _readers.Add((actor, Math.Max(0, leadSec), tcs));
         }
         return tcs;
     }
 
-    public List<(string Actor, TaskCompletionSource Started)> BeforeSwitchReaders()
+    public List<(string Actor, int LeadSec, TaskCompletionSource Started)> BeforeSwitchReaders()
     {
         lock (_readers)
         {

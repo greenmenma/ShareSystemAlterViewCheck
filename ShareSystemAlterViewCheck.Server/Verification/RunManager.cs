@@ -353,7 +353,7 @@ public sealed class RunManager(
             var r = req.Readers[i];
             var when = r.Trigger switch
             {
-                ReaderTrigger.BeforeSwitch => $"更新{r.TriggerUpdate}の切替直前に開始",
+                ReaderTrigger.BeforeSwitch => $"更新{r.TriggerUpdate}の切替{r.StartDelaySec}秒前に開始",
                 ReaderTrigger.SwitchBlocked => $"更新{r.TriggerUpdate}の切替がロック待機になって{r.StartDelaySec}秒後に開始",
                 _ => $"検証開始{r.StartDelaySec}秒後に開始",
             };

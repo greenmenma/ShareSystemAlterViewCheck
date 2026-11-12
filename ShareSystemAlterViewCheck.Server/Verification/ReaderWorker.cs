@@ -15,7 +15,7 @@ public sealed class ReaderWorker
     private readonly ReaderSpec spec;
     private readonly string actor;
 
-    /// <summary>「切替直前」開始のとき、読み取り中になったことを更新処理へ通知する</summary>
+    /// <summary>「切替の N 秒前」開始のとき、読み取り中になったことを更新処理へ通知する</summary>
     private readonly TaskCompletionSource? _started;
 
     /// <summary>SELECT を送った時刻（検証開始からの ms）</summary>
@@ -32,7 +32,7 @@ public sealed class ReaderWorker
         // 更新処理が切替前に待てるよう、検証開始前に登録しておく
         if (spec.Trigger == ReaderTrigger.BeforeSwitch)
         {
-            _started = ctx.SwitchOf(spec.TriggerUpdate).RegisterBeforeSwitchReader(actor);
+            _started = ctx.SwitchOf(spec.TriggerUpdate).RegisterBeforeSwitchReader(actor, spec.StartDelaySec);
         }
     }
 
@@ -124,7 +124,7 @@ public sealed class ReaderWorker
         {
             case ReaderTrigger.BeforeSwitch:
             {
-                var waitPhase = ctx.BeginPhase(actor, $"開始待ち（更新{spec.TriggerUpdate}の切替直前）", "Wait");
+                var waitPhase = ctx.BeginPhase(actor, $"開始待ち（更新{spec.TriggerUpdate}の切替前）", "Wait");
                 var reached = await ctx.SwitchOf(spec.TriggerUpdate).Ready.Task.WaitAsync(ct);
                 ctx.EndPhase(waitPhase);
                 if (!reached)
@@ -132,7 +132,7 @@ public sealed class ReaderWorker
                     Skip($"更新{spec.TriggerUpdate}が切替に到達しなかったため実行しませんでした");
                     return false;
                 }
-                ctx.Info(actor, $"更新{spec.TriggerUpdate}が切替直前に到達しました。読み取りを開始します（更新処理は読み取り開始を待って切替します）");
+                ctx.Info(actor, $"更新{spec.TriggerUpdate}が切替前に到達しました。読み取りを開始します（更新処理は読み取り開始から {spec.StartDelaySec} 秒後に切替します）");
                 return true;
             }
             case ReaderTrigger.SwitchBlocked:
