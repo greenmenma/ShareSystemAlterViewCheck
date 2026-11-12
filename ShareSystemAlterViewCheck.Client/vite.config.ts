@@ -33,8 +33,13 @@ function getDevCertificate() {
     return { key: fs.readFileSync(keyFilePath), cert: fs.readFileSync(certFilePath) };
 }
 
-// API の転送先（ASP.NET Core 側）。SpaProxy / Aspire から渡される環境変数を優先する
+// API の転送先（ASP.NET Core 側）
+//   Aspire から起動：WithReference(server) で渡される services__server__https__0
+//   SpaProxy から起動：ASPNETCORE_HTTPS_PORT / ASPNETCORE_URLS
 function getApiTarget() {
+    if (env.services__server__https__0) {
+        return env.services__server__https__0;
+    }
     if (env.ASPNETCORE_HTTPS_PORT) {
         return `https://localhost:${env.ASPNETCORE_HTTPS_PORT}`;
     }

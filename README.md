@@ -71,11 +71,11 @@ GRANT VIEW SERVER STATE TO [ログイン名];  -- SQL Server 2022 以降は VIEW
 
 1. 検証用 SQL Server の接続文字列を `ShareSystemAlterViewCheck.Server/appsettings.json` の `ConnectionStrings:VerifyDb` に記載します（DB は事前に作成しておきます）。
 2. スタートアップ プロジェクトを選んで F5 で起動します。
-   - `ShareSystemAlterViewCheck.AppHost`：Aspire ダッシュボード付きで Server を起動します。
-   - `ShareSystemAlterViewCheck.Server`（`https` プロファイル）：Server 単体で起動します。
-3. どちらも SpaProxy が Vite 開発サーバー（`https://localhost:52731`）を起動し、ブラウザーで画面が開きます。
+   - `ShareSystemAlterViewCheck.AppHost`（推奨）：Aspire が Server と Client（Vite 開発サーバー）を同時に起動します。Aspire ダッシュボードで両方のログを確認でき、画面は `client` リソースの URL（`https://localhost:52731`）から開きます。
+   - `ShareSystemAlterViewCheck.Server`（`https` プロファイル）：Server 単体で起動し、SpaProxy が Vite 開発サーバー（`https://localhost:52731`）を起動します。
+   - Aspire から起動した場合、Server の SpaProxy は無効になります（Vite の二重起動を防ぐため）。
 
-- 初回のデバッグビルド時、Client の `node_modules` がなければ自動で `npm install` を実行します。
+- Client の `npm install` は自動で実行されます（Aspire 起動時は `client` の前に毎回、Server 単体起動時は `node_modules` がない場合のみデバッグビルド時に実行）。
 - HTTPS の開発証明書は初回起動時に Visual Studio が信頼するか確認します（または `dotnet dev-certs https --trust`）。
 - デバッグ時だけ別の接続先を使いたい場合は、`appsettings.Development.json` に `ConnectionStrings:VerifyDb` を追加すると上書きされます。
 
