@@ -18,6 +18,19 @@ public sealed class UpdaterWorker(RunContext ctx, string connectionString, RunRe
 
     public async Task RunAsync(CancellationToken ct)
     {
+        try
+        {
+            await RunAllAsync(ct);
+        }
+        finally
+        {
+            // 発生しなかった切替のシグナルを完了させ、待っている読み取りを解放する
+            ctx.CompleteAllSwitches();
+        }
+    }
+
+    private async Task RunAllAsync(CancellationToken ct)
+    {
         var started = Stopwatch.StartNew();
         for (var i = 1; i <= Math.Max(1, req.UpdateCount); i++)
         {
@@ -130,7 +143,7 @@ public sealed class UpdaterWorker(RunContext ctx, string connectionString, RunRe
                 EXEC sp_rename N'{DbObjects.Q(DbObjects.PublicTableNew)}', N'{DbObjects.PublicTable}';
             COMMIT;
             """;
-        result.SwitchMs = await ExecPhaseAsync(conn, $"{label}: 切替 DROP + RENAME", switchSql, ct, isSwitch: true);
+        result.SwitchMs = await SwitchPhaseAsync(conn, result, $"{label}: 切替 DROP + RENAME", switchSql, ct);
     }
 
     // ===== 全件更新：Blue/Green（ビュー/シノニム） =====
@@ -177,7 +190,7 @@ public sealed class UpdaterWorker(RunContext ctx, string connectionString, RunRe
                 COMMIT;
                 """;
         }
-        result.SwitchMs = await ExecPhaseAsync(conn, switchName, switchSql, ct, isSwitch: true);
+        result.SwitchMs = await SwitchPhaseAsync(conn, result, switchName, switchSql, ct);
     }
 
     // ===== 差分更新 =====
@@ -216,7 +229,59 @@ public sealed class UpdaterWorker(RunContext ctx, string connectionString, RunRe
             WHEN NOT MATCHED BY TARGET THEN
                 INSERT ({DbObjects.Columns}) VALUES (s.Id, s.Code, s.Name, s.Amount, s.UpdatedAt, s.Payload);
             """;
-        result.SwitchMs = await ExecPhaseAsync(conn, $"{label}: MERGE → {target}", mergeSql, ct, isSwitch: true);
+        result.SwitchMs = await SwitchPhaseAsync(conn, result, $"{label}: MERGE → {target}", mergeSql, ct);
+    }
+
+    /// <summary>
+    /// 切替（DROP+RENAME / ALTER VIEW / SYNONYM / MERGE）を実行する。
+    /// ・「切替直前」に開始する読み取りがあれば、読み取り中になるのを待ってから実行する
+    /// ・切替がロック待機になったら「切替待機中」に開始する読み取りへ通知する
+    /// </summary>
+    private async Task<long> SwitchPhaseAsync(SqlConnection conn, UpdateResult result, string name, string sql, CancellationToken ct)
+    {
+        var sig = ctx.SwitchOf(result.Index);
+        sig.Ready.TrySetResult(true);
+
+        var readers = sig.BeforeSwitchReaders();
+        if (readers.Count > 0)
+        {
+            var names = string.Join(", ", readers.Select(r => r.Actor));
+            var waitPhase = ctx.BeginPhase(Actor, $"読み取りの開始待ち（{names}）", "Wait");
+            ctx.Info(Actor, $"切替の前に読み取り（{names}）が実行中になるのを待っています");
+            try
+            {
+                await Task.WhenAll(readers.Select(r => r.Started.Task)).WaitAsync(TimeSpan.FromSeconds(120), ct);
+                ctx.EndPhase(waitPhase);
+            }
+            catch (TimeoutException)
+            {
+                ctx.EndPhase(waitPhase, "Timeout");
+                ctx.Warn(Actor, "読み取りが 120 秒たっても開始しないため、そのまま切替を実行します");
+            }
+            // 読み取り側が確実にロック（Sch-S / S）を保持している状態にしてから切替える
+            await Task.Delay(500, ct);
+            ctx.Info(Actor, "読み取りが実行中になったので切替を実行します");
+        }
+
+        ctx.ActiveSwitchIndex = result.Index;
+        result.SwitchStartMs = ctx.ElapsedMs;
+        try
+        {
+            var exec = ExecPhaseAsync(conn, name, sql, ct, isSwitch: true);
+            // ロック監視で検出できない場合（VIEW SERVER STATE がない等）の保険：3 秒たっても終わらなければ待機中とみなす
+            var first = await Task.WhenAny(exec, Task.Delay(3000, ct));
+            if (first != exec && !ct.IsCancellationRequested && sig.Blocked.TrySetResult(true))
+            {
+                ctx.Warn(Actor, "切替が 3 秒以上終わらないため、ロック待機中とみなします（ロック監視では未検出）");
+            }
+            return await exec;
+        }
+        finally
+        {
+            result.SwitchEndMs = ctx.ElapsedMs;
+            ctx.ActiveSwitchIndex = 0;
+            sig.Blocked.TrySetResult(false);
+        }
     }
 
     private string LockTimeoutSql() => req.LockTimeoutMs >= 0 ? $"SET LOCK_TIMEOUT {req.LockTimeoutMs};\n" : "";

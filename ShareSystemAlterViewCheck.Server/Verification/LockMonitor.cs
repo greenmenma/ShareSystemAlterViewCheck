@@ -190,6 +190,13 @@ public sealed class LockMonitor(RunContext ctx, string connectionString, int int
 
             ctx.Warn(Actor, $"ブロック発生: {victim} が {blocker} の終了を {info.WaitType} で待機しています", detail);
 
+            // 切替がロック待機になった → 「切替待機中」に開始する読み取りへ通知
+            var switchIndex = ctx.ActiveSwitchIndex;
+            if (victim == UpdaterWorker.Actor && switchIndex > 0 && ctx.SwitchOf(switchIndex).Blocked.TrySetResult(true))
+            {
+                ctx.Info(Actor, $"更新{switchIndex}の切替がロック待機になりました（待機中に開始する読み取りへ通知）");
+            }
+
             // 実際の待機開始は wait_time ぶん前
             var startMs = Math.Max(0, now - info.WaitMs);
             var phaseId = ctx.BeginPhase(victim, $"ロック待機 ({info.WaitType})", "Blocked", $"ブロック元: {blocker}");

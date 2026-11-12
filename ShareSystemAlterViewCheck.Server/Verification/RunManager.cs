@@ -241,6 +241,23 @@ public sealed class RunManager(
         var updaterBlocked = blocked.Where(p => p.Actor == UpdaterWorker.Actor).ToList();
         var updaterMaxBlocked = updaterBlocked.Count == 0 ? 0 : updaterBlocked.Max(p => (p.EndMs ?? p.StartMs) - p.StartMs);
 
+        // 後から来た読み取りの待機（ロック監視の検出 + 最初の行が返るまでの時間）
+        var readerBlocked = blocked.Where(p => p.Actor.StartsWith("Reader", StringComparison.Ordinal)).ToList();
+        summary.ReaderBlockCount = readerBlocked.Count;
+        summary.ReaderMaxBlockedMs = Math.Max(
+            readerBlocked.Count == 0 ? 0 : readerBlocked.Max(p => (p.EndMs ?? p.StartMs) - p.StartMs),
+            summary.Readers.Max(r => r.FirstRowMs) ?? 0);
+
+        // 切替の開始時点で読み取りが実行中だったか（重なっていなければ検証として成立しない）
+        var readerWork = phases.Where(p => p.Kind == "Work" && p.Actor.StartsWith("Reader", StringComparison.Ordinal)).ToList();
+        var switches = summary.Updates.Where(u => u.SwitchStartMs.HasValue).ToList();
+        summary.SwitchOverlapped = switches.Any(u => readerWork.Any(p =>
+            p.StartMs <= u.SwitchStartMs!.Value && (p.EndMs ?? long.MaxValue) > u.SwitchStartMs.Value));
+
+        var readerNote = summary.ReaderMaxBlockedMs >= 1000
+            ? $"／切替待機中に開始した読み取りも最大 {summary.ReaderMaxBlockedMs:N0}ms 待機"
+            : "";
+
         if (status == RunStatus.Failed)
         {
             summary.Verdict = "検証を実行できませんでした（ログを確認してください）";
@@ -251,19 +268,29 @@ public sealed class RunManager(
             summary.Verdict = "キャンセルされました";
             summary.VerdictLevel = "Warn";
         }
+        else if (summary.Readers.Count > 0 && switches.Count > 0 && !summary.SwitchOverlapped)
+        {
+            summary.Verdict = "検証不成立 — 切替の時点で実行中の読み取りがありませんでした（読み取りの開始タイミング・継続時間を見直してください）";
+            summary.VerdictLevel = "Warn";
+        }
         else if (summary.TimeoutCount > 0)
         {
-            summary.Verdict = $"更新がタイムアウトしました（{summary.TimeoutCount}件）— ロック問題が発生";
+            summary.Verdict = $"更新がタイムアウトしました（{summary.TimeoutCount}件）— ロック問題が発生{readerNote}";
             summary.VerdictLevel = "Error";
         }
         else if (summary.ErrorCount > 0)
         {
-            summary.Verdict = $"エラーが発生しました（{summary.ErrorCount}件）";
+            summary.Verdict = $"エラーが発生しました（{summary.ErrorCount}件）{readerNote}";
             summary.VerdictLevel = "Error";
         }
         else if (updaterMaxBlocked >= 1000)
         {
-            summary.Verdict = $"更新は成功したが、ロック待機が発生（最大 {updaterMaxBlocked:N0}ms）";
+            summary.Verdict = $"更新は成功したが、ロック待機が発生（最大 {updaterMaxBlocked:N0}ms）{readerNote}";
+            summary.VerdictLevel = "Warn";
+        }
+        else if (summary.ReaderMaxBlockedMs >= 1000)
+        {
+            summary.Verdict = $"更新は成功したが、読み取りが待機（最大 {summary.ReaderMaxBlockedMs:N0}ms）";
             summary.VerdictLevel = "Warn";
         }
         else
@@ -289,6 +316,7 @@ public sealed class RunManager(
         foreach (var r in req.Readers)
         {
             r.StartDelaySec = Math.Clamp(r.StartDelaySec, 0, 3600);
+            r.TriggerUpdate = Math.Clamp(r.TriggerUpdate, 1, req.UpdateCount);
             r.DurationSec = Math.Clamp(r.DurationSec, 1, 3600);
         }
     }
@@ -323,7 +351,13 @@ public sealed class RunManager(
         for (var i = 0; i < req.Readers.Count; i++)
         {
             var r = req.Readers[i];
-            lines.Add($"Reader{i + 1,-9}: {ReaderWorker.KindText(r.Kind)} / {r.StartDelaySec}秒後に開始 / {r.DurationSec}秒間");
+            var when = r.Trigger switch
+            {
+                ReaderTrigger.BeforeSwitch => $"更新{r.TriggerUpdate}の切替直前に開始",
+                ReaderTrigger.SwitchBlocked => $"更新{r.TriggerUpdate}の切替がロック待機になって{r.StartDelaySec}秒後に開始",
+                _ => $"検証開始{r.StartDelaySec}秒後に開始",
+            };
+            lines.Add($"Reader{i + 1,-9}: {ReaderWorker.KindText(r.Kind)} / {when} / {r.DurationSec}秒間");
         }
         if (!string.IsNullOrWhiteSpace(req.Memo))
         {

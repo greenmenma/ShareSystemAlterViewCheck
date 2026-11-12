@@ -31,6 +31,17 @@ public enum ReaderKind
     HeavyQuery,
 }
 
+/// <summary>読み取りを開始するタイミング</summary>
+public enum ReaderTrigger
+{
+    /// <summary>検証開始から StartDelaySec 秒後</summary>
+    RunStart,
+    /// <summary>更新の切替（DROP+RENAME / ALTER VIEW 等）の直前。更新処理は読み取りが始まるのを待ってから切替を実行する</summary>
+    BeforeSwitch,
+    /// <summary>更新の切替がロック待機になってから StartDelaySec 秒後（待機中に後から来た SELECT を再現）</summary>
+    SwitchBlocked,
+}
+
 /// <summary>Blue/Green 方式で非アクティブ側テーブルを空にする方法</summary>
 public enum InactivePrep
 {
@@ -59,7 +70,13 @@ public sealed class ReaderSpec
 {
     public ReaderKind Kind { get; set; } = ReaderKind.SlowRead;
 
-    /// <summary>検証開始からの開始遅延（秒）</summary>
+    /// <summary>開始タイミング</summary>
+    public ReaderTrigger Trigger { get; set; } = ReaderTrigger.RunStart;
+
+    /// <summary>トリガー対象の更新回（Trigger が BeforeSwitch / SwitchBlocked のとき。1 始まり）</summary>
+    public int TriggerUpdate { get; set; } = 1;
+
+    /// <summary>開始遅延（秒）。RunStart は検証開始から、SwitchBlocked はロック待機の検出から。BeforeSwitch では使わない</summary>
     public int StartDelaySec { get; set; }
 
     /// <summary>読み取りを続ける時間（秒）</summary>
@@ -145,6 +162,11 @@ public sealed class UpdateResult
     public long? PrepareMs { get; set; }
     public long? BulkCopyMs { get; set; }
     public long? SwitchMs { get; set; }
+
+    /// <summary>切替 SQL の開始・終了（検証開始からの ms）。読み取りとの重なり判定に使う</summary>
+    public long? SwitchStartMs { get; set; }
+    public long? SwitchEndMs { get; set; }
+
     public long RowsCopied { get; set; }
     public string? FromTable { get; set; }
     public string? ToTable { get; set; }
@@ -155,11 +177,19 @@ public sealed class ReaderResult
 {
     public string Actor { get; set; } = "";
     public ReaderKind Kind { get; set; }
+    public ReaderTrigger Trigger { get; set; }
     public string Result { get; set; } = "";
     public bool Success { get; set; }
     public string? Target { get; set; }
     public string? ResolvedTable { get; set; }
     public long RowsRead { get; set; }
+
+    /// <summary>読み取り開始（検証開始からの ms）</summary>
+    public long? StartMs { get; set; }
+
+    /// <summary>SELECT を送ってから最初の行（HOLDLOCK は SELECT 完了）が返るまでの時間。ロック待ちで止まるとここが長くなる</summary>
+    public long? FirstRowMs { get; set; }
+
     public long? DurationMs { get; set; }
     public string? Error { get; set; }
 }
@@ -177,6 +207,14 @@ public sealed class RunSummary
     public int BlockCount { get; set; }
     public int TimeoutCount { get; set; }
     public int ErrorCount { get; set; }
+
+    /// <summary>切替の開始時点で実行中の読み取りがあったか（false なら検証不成立）</summary>
+    public bool SwitchOverlapped { get; set; }
+
+    /// <summary>読み取りセッションのロック待機（後から来た SELECT が切替待ちに巻き込まれた時間）</summary>
+    public int ReaderBlockCount { get; set; }
+    public long ReaderMaxBlockedMs { get; set; }
+
     public List<UpdateResult> Updates { get; set; } = [];
     public List<ReaderResult> Readers { get; set; } = [];
 }

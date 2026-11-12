@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { api } from '../api';
-import { modeLabel, readerKindLabel, updateTypeLabel } from '../format';
-import type { EnvironmentStatus, InactivePrep, PublishMode, ReaderKind, RunRequest, UpdateType } from '../types';
+import { modeLabel, readerKindLabel, readerTriggerLabel, updateTypeLabel } from '../format';
+import type { EnvironmentStatus, InactivePrep, PublishMode, ReaderKind, ReaderSpec, ReaderTrigger, RunRequest, UpdateType } from '../types';
 
 interface Preset {
     key: string;
@@ -12,10 +12,18 @@ interface Preset {
     request: RunRequest;
 }
 
+// 検証したいパターン：
+//   読取1 が切替の直前から読み続ける → 切替（DROP/ALTER）がロック待機 → 待機中に読取2 が新たに SELECT
+// 開始タイミングは更新処理のイベントに連動するので、BulkCopy の速さに関係なく必ずこの順序になる
+const blockingReaders: ReaderSpec[] = [
+    { kind: 'SlowRead', trigger: 'BeforeSwitch', triggerUpdate: 1, startDelaySec: 0, durationSec: 60 },
+    { kind: 'SlowRead', trigger: 'SwitchBlocked', triggerUpdate: 1, startDelaySec: 5, durationSec: 10 },
+];
+
 const base: RunRequest = {
     mode: 'Table',
     updateType: 'Full',
-    readers: [{ kind: 'SlowRead', startDelaySec: 0, durationSec: 60 }],
+    readers: blockingReaders,
     updaterStartDelaySec: 5,
     updateCount: 1,
     updateIntervalSec: 20,
@@ -33,7 +41,7 @@ const presets: Preset[] = [
         expect: 'タイムアウト想定',
         expectLevel: 'error',
         description:
-            '公開テーブルを 60 秒間読み続けている間に全件更新。DROP TABLE が読み取りの終了を待機（LCK_M_X / LCK_M_SCH_M）し、CommandTimeout(30秒) で失敗する現象を再現します。',
+            '読取1 が切替の直前から公開テーブルを 60 秒読み続け、DROP TABLE がロック待機（LCK_M_SCH_M）。待機になって 5 秒後に読取2 が新たに SELECT し、読取2 も DROP の後ろで待たされる（LCK_M_SCH_S）ことと、CommandTimeout(30秒) で更新が失敗する現象を再現します。',
         request: { ...base, title: '① 現行: テーブル公開 × 長時間SELECT', mode: 'Table' },
     },
     {
@@ -42,7 +50,7 @@ const presets: Preset[] = [
         expect: '改修方式の検証',
         expectLevel: 'warn',
         description:
-            '同じ条件をビュー公開で実行。非アクティブ側テーブルへ BulkCopy した後 ALTER VIEW で切り替えます。読み取り中のビューに対する ALTER VIEW が待機するか（Sch-M ロック）を確認します。',
+            '①と同じ読み取りパターンをビュー公開で実行。非アクティブ側へ BulkCopy した後 ALTER VIEW で切り替えます。読み取り中のビューに対する ALTER VIEW が待機するか、待機中に来た読取2 が止まるかを確認します。',
         request: { ...base, title: '② 改修後: ビュー公開 × 長時間SELECT', mode: 'View' },
     },
     {
@@ -56,7 +64,7 @@ const presets: Preset[] = [
             ...base,
             title: '③ 改修後: ビュー公開 × 連続2回切替',
             mode: 'View',
-            readers: [{ kind: 'SlowRead', startDelaySec: 0, durationSec: 90 }],
+            readers: [{ kind: 'SlowRead', trigger: 'RunStart', startDelaySec: 0, durationSec: 90 }],
             updateCount: 2,
             updateIntervalSec: 20,
         },
@@ -66,7 +74,7 @@ const presets: Preset[] = [
         title: '④ 参考：シノニム',
         expect: '比較用',
         expectLevel: 'warn',
-        description: 'DROP SYNONYM / CREATE SYNONYM による切替を同じ条件で実行し、ALTER VIEW と比較します。',
+        description: 'DROP SYNONYM / CREATE SYNONYM による切替を①②と同じ読み取りパターンで実行し、ALTER VIEW と比較します。',
         request: { ...base, title: '④ 参考: シノニム公開 × 長時間SELECT', mode: 'Synonym' },
     },
     {
@@ -75,13 +83,16 @@ const presets: Preset[] = [
         expect: '待機の確認',
         expectLevel: 'warn',
         description:
-            'HOLDLOCK でテーブルロックを 40 秒保持している間に差分更新（MERGE）を実行。差分更新側のロック待機を確認します。',
+            'MERGE の直前から読取1 が HOLDLOCK でテーブルロックを 40 秒保持。MERGE のロック待機と、待機中に来た読取2 の待機を確認します。',
         request: {
             ...base,
             title: '⑤ 差分更新 × HOLDLOCK',
             mode: 'Table',
             updateType: 'Diff',
-            readers: [{ kind: 'HoldLock', startDelaySec: 0, durationSec: 40 }],
+            readers: [
+                { kind: 'HoldLock', trigger: 'BeforeSwitch', triggerUpdate: 1, startDelaySec: 0, durationSec: 40 },
+                { kind: 'SlowRead', trigger: 'SwitchBlocked', triggerUpdate: 1, startDelaySec: 5, durationSec: 10 },
+            ],
         },
     },
 ];
@@ -119,9 +130,14 @@ export default function RunForm({ env, onStarted }: Props) {
 
     const blueGreen = req.mode !== 'Table' && req.updateType === 'Full';
     const totalSec = Math.max(
-        ...req.readers.map((r) => r.startDelaySec + r.durationSec),
+        ...req.readers.map((r) => ((r.trigger ?? 'RunStart') === 'RunStart' ? r.startDelaySec : req.updaterStartDelaySec) + r.durationSec),
         req.updaterStartDelaySec + (req.updateCount - 1) * req.updateIntervalSec + req.commandTimeoutSec,
     );
+    const updateReader = (i: number, patch: Partial<ReaderSpec>) => {
+        const readers = [...req.readers];
+        readers[i] = { ...readers[i], ...patch };
+        set('readers', readers);
+    };
 
     return (
         <div className="stack">
@@ -236,52 +252,63 @@ export default function RunForm({ env, onStarted }: Props) {
                             <tr>
                                 <th>#</th>
                                 <th>種類</th>
-                                <th>開始（秒後）</th>
+                                <th>開始タイミング</th>
+                                <th>対象の更新回</th>
+                                <th>N（秒）</th>
                                 <th>継続時間（秒）</th>
                                 <th />
                             </tr>
                         </thead>
                         <tbody>
-                            {req.readers.map((r, i) => (
-                                <tr key={i}>
-                                    <td>読取{i + 1}</td>
-                                    <td>
-                                        <select value={r.kind} onChange={(e) => {
-                                            const readers = [...req.readers];
-                                            readers[i] = { ...r, kind: e.target.value as ReaderKind };
-                                            set('readers', readers);
-                                        }}>
-                                            {(Object.keys(readerKindLabel) as ReaderKind[]).map((k) => (
-                                                <option key={k} value={k}>{readerKindLabel[k]}</option>
-                                            ))}
-                                        </select>
-                                    </td>
-                                    <td>
-                                        <input type="number" min={0} value={r.startDelaySec} onChange={(e) => {
-                                            const readers = [...req.readers];
-                                            readers[i] = { ...r, startDelaySec: Number(e.target.value) };
-                                            set('readers', readers);
-                                        }} />
-                                    </td>
-                                    <td>
-                                        <input type="number" min={1} value={r.durationSec} onChange={(e) => {
-                                            const readers = [...req.readers];
-                                            readers[i] = { ...r, durationSec: Number(e.target.value) };
-                                            set('readers', readers);
-                                        }} />
-                                    </td>
-                                    <td>
-                                        <button className="btn btn-small" onClick={() => set('readers', req.readers.filter((_, j) => j !== i))}>
-                                            削除
-                                        </button>
-                                    </td>
-                                </tr>
-                            ))}
+                            {req.readers.map((r, i) => {
+                                const trigger = r.trigger ?? 'RunStart';
+                                return (
+                                    <tr key={i}>
+                                        <td>読取{i + 1}</td>
+                                        <td>
+                                            <select value={r.kind} onChange={(e) => updateReader(i, { kind: e.target.value as ReaderKind })}>
+                                                {(Object.keys(readerKindLabel) as ReaderKind[]).map((k) => (
+                                                    <option key={k} value={k}>{readerKindLabel[k]}</option>
+                                                ))}
+                                            </select>
+                                        </td>
+                                        <td>
+                                            <select value={trigger} onChange={(e) => updateReader(i, { trigger: e.target.value as ReaderTrigger })}>
+                                                {(Object.keys(readerTriggerLabel) as ReaderTrigger[]).map((k) => (
+                                                    <option key={k} value={k}>{readerTriggerLabel[k]}</option>
+                                                ))}
+                                            </select>
+                                        </td>
+                                        <td>
+                                            <input type="number" min={1} max={req.updateCount} value={r.triggerUpdate ?? 1}
+                                                disabled={trigger === 'RunStart'}
+                                                onChange={(e) => updateReader(i, { triggerUpdate: Number(e.target.value) })} />
+                                        </td>
+                                        <td>
+                                            <input type="number" min={0} value={r.startDelaySec} disabled={trigger === 'BeforeSwitch'}
+                                                onChange={(e) => updateReader(i, { startDelaySec: Number(e.target.value) })} />
+                                        </td>
+                                        <td>
+                                            <input type="number" min={1} value={r.durationSec}
+                                                onChange={(e) => updateReader(i, { durationSec: Number(e.target.value) })} />
+                                        </td>
+                                        <td>
+                                            <button className="btn btn-small" onClick={() => set('readers', req.readers.filter((_, j) => j !== i))}>
+                                                削除
+                                            </button>
+                                        </td>
+                                    </tr>
+                                );
+                            })}
                         </tbody>
                     </table>
                 </div>
+                <p className="hint">
+                    「切替の直前」は、更新処理が BulkCopy を終えて切替 SQL を出す前に読み取りを開始し、読み取り中になったのを確認してから切替えます。
+                    「切替がロック待機になってから」は、ロック監視が切替の待機を検出してから N 秒後に開始します（検出できない場合は切替開始から 3 秒で待機中とみなします）。
+                </p>
                 <button className="btn btn-small" onClick={() =>
-                    set('readers', [...req.readers, { kind: 'SlowRead', startDelaySec: 0, durationSec: 60 }])}>
+                    set('readers', [...req.readers, { kind: 'SlowRead', trigger: 'RunStart', triggerUpdate: 1, startDelaySec: 0, durationSec: 60 }])}>
                     ＋ 読み取りを追加
                 </button>
 

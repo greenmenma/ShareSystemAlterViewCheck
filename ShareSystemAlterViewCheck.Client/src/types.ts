@@ -3,6 +3,7 @@
 export type PublishMode = 'Table' | 'View' | 'Synonym';
 export type UpdateType = 'Full' | 'Diff';
 export type ReaderKind = 'SlowRead' | 'HoldLock' | 'HeavyQuery';
+export type ReaderTrigger = 'RunStart' | 'BeforeSwitch' | 'SwitchBlocked';
 export type InactivePrep = 'Truncate' | 'DropCreate' | 'Delete';
 export type RunStatus = 'Running' | 'Completed' | 'Cancelled' | 'Failed' | 'Aborted';
 export type RunKind = 'Verification' | 'Setup';
@@ -10,6 +11,10 @@ export type Level = 'Info' | 'Success' | 'Warn' | 'Error' | 'Sql';
 
 export interface ReaderSpec {
     kind: ReaderKind;
+    /** 開始タイミング（古いログには無いので省略時は RunStart 扱い） */
+    trigger?: ReaderTrigger;
+    /** トリガー対象の更新回（1 始まり） */
+    triggerUpdate?: number;
     startDelaySec: number;
     durationSec: number;
 }
@@ -59,6 +64,8 @@ export interface UpdateResult {
     prepareMs?: number | null;
     bulkCopyMs?: number | null;
     switchMs?: number | null;
+    switchStartMs?: number | null;
+    switchEndMs?: number | null;
     rowsCopied: number;
     fromTable?: string | null;
     toTable?: string | null;
@@ -68,11 +75,14 @@ export interface UpdateResult {
 export interface ReaderResult {
     actor: string;
     kind: ReaderKind;
+    trigger?: ReaderTrigger;
     result: string;
     success: boolean;
     target?: string | null;
     resolvedTable?: string | null;
     rowsRead: number;
+    startMs?: number | null;
+    firstRowMs?: number | null;
     durationMs?: number | null;
     error?: string | null;
 }
@@ -85,6 +95,9 @@ export interface RunSummary {
     blockCount: number;
     timeoutCount: number;
     errorCount: number;
+    switchOverlapped?: boolean;
+    readerBlockCount?: number;
+    readerMaxBlockedMs?: number;
     updates: UpdateResult[];
     readers: ReaderResult[];
 }

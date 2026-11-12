@@ -1,4 +1,4 @@
-import type { PublishMode, ReaderKind, RunStatus, UpdateType } from './types';
+import type { PublishMode, ReaderKind, ReaderSpec, ReaderTrigger, RunStatus, UpdateType } from './types';
 
 export const modeLabel: Record<PublishMode, string> = {
     Table: 'テーブル公開（現行）',
@@ -22,6 +22,25 @@ export const readerKindLabel: Record<ReaderKind, string> = {
     HoldLock: 'HOLDLOCK 保持（トランザクションでロック保持）',
     HeavyQuery: '重い集計（自己結合・指定時間で打ち切り）',
 };
+
+export const readerTriggerLabel: Record<ReaderTrigger, string> = {
+    RunStart: '検証開始から N 秒後',
+    BeforeSwitch: '切替の直前（更新は読み取り開始を待って切替）',
+    SwitchBlocked: '切替がロック待機になってから N 秒後',
+};
+
+/** 読み取りの開始タイミングを短い文で表す */
+export function readerWhen(r: ReaderSpec): string {
+    const u = r.triggerUpdate ?? 1;
+    switch (r.trigger ?? 'RunStart') {
+        case 'BeforeSwitch':
+            return `更新${u}の切替直前に開始`;
+        case 'SwitchBlocked':
+            return `更新${u}の切替がロック待機になって${r.startDelaySec}秒後に開始`;
+        default:
+            return `検証開始${r.startDelaySec}秒後に開始`;
+    }
+}
 
 export const statusLabel: Record<RunStatus, string> = {
     Running: '実行中',

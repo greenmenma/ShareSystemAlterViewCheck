@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { api } from '../api';
 import {
-    actorLabel, dateTime, downloadText, modeLabel, ms, readerKindLabel, statusLabel, updateTypeLabel,
+    actorLabel, dateTime, downloadText, modeLabel, ms, readerKindLabel, readerWhen, statusLabel, updateTypeLabel,
 } from '../format';
 import type { RunRecord } from '../types';
 import EventLog from './EventLog';
@@ -108,6 +108,12 @@ export default function RunDetail({ id, onDeleted }: Props) {
                     <Metric label="ブロック発生回数" value={`${s.blockCount} 回`} level={s.blockCount > 0 ? 'warn' : 'success'} />
                     <Metric label="タイムアウト" value={`${s.timeoutCount} 件`} level={s.timeoutCount > 0 ? 'error' : 'success'} />
                     <Metric label="エラー" value={`${s.errorCount} 件`} level={s.errorCount > 0 ? 'error' : 'success'} />
+                    {s.readerMaxBlockedMs != null && (
+                        <Metric label="後続の読み取りの待機" value={ms(s.readerMaxBlockedMs)} level={s.readerMaxBlockedMs >= 1000 ? 'warn' : 'success'} />
+                    )}
+                    {s.switchOverlapped != null && s.readers.length > 0 && (
+                        <Metric label="切替時の読み取り" value={s.switchOverlapped ? '実行中（成立）' : 'なし（不成立）'} level={s.switchOverlapped ? 'success' : 'warn'} />
+                    )}
                     <Metric
                         label="切替/反映 最大時間"
                         value={s.updates.some((u) => u.switchMs != null)
@@ -129,7 +135,7 @@ export default function RunDetail({ id, onDeleted }: Props) {
                         <span><b>LOCK_TIMEOUT</b>{req.lockTimeoutMs < 0 ? '無制限' : `${req.lockTimeoutMs}ms`}</span>
                         {req.mode !== 'Table' && req.updateType === 'Full' && <span><b>非アクティブ準備</b>{req.inactivePrep}</span>}
                         {req.readers.map((r, i) => (
-                            <span key={i}><b>読取{i + 1}</b>{readerKindLabel[r.kind].split('（')[0]} / {r.startDelaySec}秒後 / {r.durationSec}秒間</span>
+                            <span key={i}><b>読取{i + 1}</b>{readerKindLabel[r.kind].split('（')[0]} / {readerWhen(r)} / {r.durationSec}秒間</span>
                         ))}
                         {req.memo && <span><b>メモ</b>{req.memo}</span>}
                     </div>
@@ -183,16 +189,18 @@ export default function RunDetail({ id, onDeleted }: Props) {
                         <div className="table-wrap">
                             <table className="grid">
                                 <thead>
-                                    <tr><th>読取</th><th>種類</th><th>結果</th><th>対象（参照先）</th><th className="num">行数</th><th className="num">時間</th></tr>
+                                    <tr><th>読取</th><th>種類</th><th>開始</th><th>結果</th><th>対象（参照先）</th><th className="num">最初の行まで</th><th className="num">行数</th><th className="num">時間</th></tr>
                                 </thead>
                                 <tbody>
                                     {s.readers.map((r) => (
                                         <tr key={r.actor}>
                                             <td>{actorLabel(r.actor)}</td>
                                             <td>{readerKindLabel[r.kind].split('（')[0]}</td>
+                                            <td className="small">{r.startMs != null ? `+${(r.startMs / 1000).toFixed(1)}s` : '—'}</td>
                                             <td><span className={`pill ${r.success ? 'pill-success' : 'pill-error'}`}>{r.result}</span>
                                                 {r.error && <div className="error-text small">{r.error}</div>}</td>
                                             <td className="mono">{r.target}{r.resolvedTable && r.resolvedTable !== r.target ? `（${r.resolvedTable}）` : ''}</td>
+                                            <td className={`num ${(r.firstRowMs ?? 0) >= 1000 ? 'strong error-text' : ''}`}>{ms(r.firstRowMs)}</td>
                                             <td className="num">{r.rowsRead.toLocaleString()}</td>
                                             <td className="num">{ms(r.durationMs)}</td>
                                         </tr>

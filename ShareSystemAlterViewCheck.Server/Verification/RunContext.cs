@@ -30,6 +30,30 @@ public sealed class RunContext
 
     public long ElapsedMs => _clock.ElapsedMilliseconds;
 
+    /// <summary>更新回ごとの切替シグナル（読み取りの開始タイミング連動用）</summary>
+    private readonly ConcurrentDictionary<int, SwitchSignals> _switches = new();
+
+    public SwitchSignals SwitchOf(int updateIndex) => _switches.GetOrAdd(updateIndex, i => new SwitchSignals(i));
+
+    /// <summary>現在実行中の切替の更新回（0 = 切替中でない）。ロック監視が参照する</summary>
+    public int ActiveSwitchIndex
+    {
+        get => Volatile.Read(ref _activeSwitchIndex);
+        set => Volatile.Write(ref _activeSwitchIndex, value);
+    }
+
+    private int _activeSwitchIndex;
+
+    /// <summary>更新処理の終了時：発生しなかったシグナルを「発生せず」で完了させ、待っている読み取りを解放する</summary>
+    public void CompleteAllSwitches()
+    {
+        foreach (var s in _switches.Values)
+        {
+            s.Ready.TrySetResult(false);
+            s.Blocked.TrySetResult(false);
+        }
+    }
+
     public void Log(string actor, string level, string message, string? detail = null)
     {
         lock (_gate)
@@ -151,4 +175,40 @@ public sealed class RunContext
 
     public string ActorOf(short spid) =>
         Sessions.TryGetValue(spid, out var name) ? name : $"外部SPID {spid}";
+}
+
+/// <summary>
+/// 1 回の更新の切替に関するシグナル
+///   Ready   : 更新処理が切替直前に到達した（false = 到達せず終了）
+///   Blocked : 切替がロック待機になった（false = 待機せずに終わった / 切替に到達しなかった）
+///   ReadersStarted : 「切替直前」に開始する読み取りが、実際に読み取り中になったことの通知
+/// </summary>
+public sealed class SwitchSignals(int index)
+{
+    public int Index { get; } = index;
+
+    public TaskCompletionSource<bool> Ready { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public TaskCompletionSource<bool> Blocked { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    private readonly List<(string Actor, TaskCompletionSource Started)> _readers = [];
+
+    /// <summary>切替直前に開始する読み取りを登録する（検証開始前に呼ぶ）</summary>
+    public TaskCompletionSource RegisterBeforeSwitchReader(string actor)
+    {
+        var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        lock (_readers)
+        {
+            _readers.Add((actor, tcs));
+        }
+        return tcs;
+    }
+
+    public List<(string Actor, TaskCompletionSource Started)> BeforeSwitchReaders()
+    {
+        lock (_readers)
+        {
+            return [.. _readers];
+        }
+    }
 }
