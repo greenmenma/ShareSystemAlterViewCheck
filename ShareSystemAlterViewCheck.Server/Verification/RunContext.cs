@@ -51,6 +51,7 @@ public sealed class RunContext
         {
             s.Ready.TrySetResult(false);
             s.Blocked.TrySetResult(false);
+            s.Started.TrySetResult(false);
         }
     }
 
@@ -190,6 +191,9 @@ public sealed class SwitchSignals(int index)
     public TaskCompletionSource<bool> Ready { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     public TaskCompletionSource<bool> Blocked { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    /// <summary>切替 SQL を開始した（false = 切替に到達しなかった）</summary>
+    public TaskCompletionSource<bool> Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     private readonly List<(string Actor, int LeadSec, TaskCompletionSource Started)> _readers = [];
 

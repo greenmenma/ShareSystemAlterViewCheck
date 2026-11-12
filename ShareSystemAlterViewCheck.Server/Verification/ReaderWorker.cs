@@ -59,7 +59,14 @@ public sealed class ReaderWorker
                 return;
             }
 
-            var targetText = mode == PublishMode.Table ? target : $"{target}（開始時の参照先: {resolved}）";
+            // 制御テーブル切替は DDL を伴わないので、開始直前に読み直しても止まらない（切替後に来た読み取りは新しい側を読む）
+            if (mode == PublishMode.Control)
+            {
+                resolved = await DbObjects.GetActiveTableAsync(conn, mode, ct);
+                Result.ResolvedTable = resolved;
+            }
+
+            var targetText = mode is PublishMode.Table or PublishMode.Switch ? target : $"{target}（開始時の参照先: {resolved}）";
             ctx.Info(actor, $"読み取り開始 [{KindText(spec.Kind)}] 対象={targetText} 予定時間={spec.DurationSec}秒 SPID={spid}");
 
             var sw = Stopwatch.StartNew();
@@ -151,6 +158,24 @@ public sealed class ReaderWorker
                     await Task.Delay(TimeSpan.FromSeconds(spec.StartDelaySec), ct);
                 }
                 ctx.EndPhase(waitPhase);
+                return true;
+            }
+            case ReaderTrigger.SwitchStarted:
+            {
+                var waitPhase = ctx.BeginPhase(actor, $"開始待ち（更新{spec.TriggerUpdate}の切替開始 + {spec.StartDelaySec}秒）", "Wait");
+                var started = await ctx.SwitchOf(spec.TriggerUpdate).Started.Task.WaitAsync(ct);
+                if (!started)
+                {
+                    ctx.EndPhase(waitPhase);
+                    Skip($"更新{spec.TriggerUpdate}が切替に到達しなかったため実行しませんでした");
+                    return false;
+                }
+                if (spec.StartDelaySec > 0)
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(spec.StartDelaySec), ct);
+                }
+                ctx.EndPhase(waitPhase);
+                ctx.Info(actor, $"更新{spec.TriggerUpdate}の切替開始から {spec.StartDelaySec} 秒たったので読み取りを開始します");
                 return true;
             }
             default:

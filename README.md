@@ -1,7 +1,7 @@
 # ShareSystemAlterViewCheck
 
 SQL Server のデータ公開システムで発生する **全件更新時のロック待機（DROP TABLE が長時間 SELECT にブロックされタイムアウトする問題）** を検証環境で再現し、
-**ビュー公開 + ALTER VIEW（Blue/Green 構成）** へ改修したときに問題が解消されるかを確認するための Web アプリです。
+**ビュー公開 + ALTER VIEW（Blue/Green 構成）** へ改修したときに問題が解消されるか、また代替案（ALTER TABLE SWITCH の低優先度待機・制御テーブル切替・全件同期 MERGE・RCSI）で解消できるかを確認するための Web アプリです。
 
 ## 構成
 
@@ -21,9 +21,22 @@ SQL Server のデータ公開システムで発生する **全件更新時のロ
 | 方式 | 全件更新の手順 |
 | --- | --- |
 | 現行：テーブル公開 | `vt_PublicTable_New` 作成 → `vt_Source` から BulkCopy → `DROP TABLE vt_PublicTable` + `sp_rename` |
-| 改修後：ビュー公開（Blue/Green） | 非アクティブ側（`vt_View_Blue` / `vt_View_Green`）を空にする → BulkCopy → `ALTER VIEW vt_PublicView` |
+| 改修案：ビュー公開（Blue/Green） | 非アクティブ側（`vt_View_Blue` / `vt_View_Green`）を空にする → BulkCopy → `ALTER VIEW vt_PublicView` |
 | 参考：シノニム公開 | 非アクティブ側を空にする → BulkCopy → `DROP SYNONYM` / `CREATE SYNONYM` |
-| 差分更新 | `vt_DiffStage` に差分を BulkCopy → 公開テーブル（ビュー方式はアクティブ側）へ `MERGE` |
+| 代替案：ALTER TABLE SWITCH | `vt_SwStage` へ BulkCopy → `ALTER TABLE vt_SwPublic SWITCH TO vt_SwOld WITH (WAIT_AT_LOW_PRIORITY …)` → `ALTER TABLE vt_SwStage SWITCH TO vt_SwPublic` |
+| 代替案：制御テーブル切替 | 非アクティブ側（`vt_Ctl_A` / `vt_Ctl_B`）を DELETE で空にする → BulkCopy → `UPDATE vt_CtlActive SET ActiveSide = …`（ビュー `vt_CtlView` の定義は固定） |
+
+| 更新種別 | 手順 |
+| --- | --- |
+| 全件更新（入替） | 上の表の各方式の手順 |
+| 差分更新 | `vt_DiffStage` に差分を BulkCopy → 公開テーブル（Blue/Green 方式はアクティブ側）へ `MERGE` |
+| 全件同期 | `vt_DiffStage` に全件を BulkCopy → `MERGE`（変わった行の UPDATE・INSERT・連携元に無い行の DELETE）。公開テーブルを作り直さない |
+
+### READ_COMMITTED_SNAPSHOT（RCSI）
+
+「環境セットアップ」タブで検証用 DB の RCSI を ON / OFF できます（ALTER DATABASE 権限が必要。接続中の他セッションは切断されます）。
+RCSI が ON だと通常の SELECT は S ロックを取らずに行バージョンを読むため、DML（UPDATE / DELETE / MERGE）と読み取りが互いに待たなくなります。
+DDL（DROP / ALTER VIEW / SWITCH）が必要とする Sch-M ロックには効果がありません。検証ログには実行時の RCSI の設定が記録されます。
 
 読み取り側（重い SELECT）は次の 3 種類から選べ、複数同時に実行できます。
 
@@ -38,6 +51,7 @@ SQL Server のデータ公開システムで発生する **全件更新時のロ
 | 検証開始から N 秒後 | 従来どおり時間で開始 |
 | 切替の N 秒前 | 更新処理が BulkCopy を終えたところで読み取りを開始し、更新処理は**読み取りが実行中になってから N 秒待って**切替（DROP+RENAME / ALTER VIEW / SYNONYM / MERGE）を実行 |
 | 切替がロック待機になってから N 秒後 | ロック監視が切替の待機を検出してから N 秒後に開始（監視で検出できない場合は、切替開始から 3 秒で待機中とみなす）。待機にならなかった場合は実行しない |
+| 切替の開始から N 秒後 | 待機の有無に関係なく、切替 SQL の開始から N 秒後に開始（方式どうしを同じ条件で比べるときに使う） |
 
 - 継続時間は最初の行が返ってから数えます（ロック待ちの時間は含めません）。「最初の行まで」の時間で、後から来た SELECT がどれだけ止められたかが分かります。
 - 切替の時点で実行中の読み取りがなかった場合、判定は「検証不成立」になります。
@@ -46,13 +60,37 @@ SQL Server のデータ公開システムで発生する **全件更新時のロ
 
 ### プリセットシナリオ
 
-①②④⑤は「読取1 が切替の 10 秒前から読み続ける → 切替がロック待機 → 待機中に読取2 が新たに SELECT」の順序で実行します。
+①②④⑥⑦⑧⑨⑩は「読取1 が切替の 10 秒前から読み続ける → 切替 → 切替開始の 5 秒後に読取2 が新たに SELECT」の順序で実行します。
 
-1. 現行方式の再現（テーブル公開。DROP の待機と、待機中に来た SELECT の待機 → タイムアウト想定）
-2. 改修後（ビュー公開。ALTER VIEW で同じパターン）
-3. 改修後・連続切替（読み取り中に 2 回切替 → 旧テーブルの TRUNCATE が待機するケースの確認）
-4. 参考：シノニム
-5. 差分更新（MERGE の 10 秒前から HOLDLOCK 保持 → 待機中に来た SELECT の待機）
+| # | シナリオ | RCSI 前提 |
+| --- | --- | --- |
+| ① | 現行方式の再現（DROP の待機と、待機中に来た SELECT の待機 → タイムアウト） | |
+| ② | 改修案：ALTER VIEW（同じパターン） | |
+| ③ | 改修案・連続切替（読み取り中に 2 回切替 → 旧テーブルの TRUNCATE が待機するケース） | |
+| ④ | 参考：シノニム | |
+| ⑤ | 差分更新 × HOLDLOCK（ロックヒントは RCSI でもロックを取る） | |
+| ⑥ | 代替案：SWITCH + 低優先度待機（切替は読取1 の終了を待つが、読取2 は止まらない） | |
+| ⑦ | 代替案：SWITCH 低優先度・時間切れ（ABORT_AFTER_WAIT = SELF で切替を中止） | |
+| ⑧ | 代替案：制御テーブル切替（DDL なし。2 回目の更新で読取1 が読んでいる側を DELETE） | ○ |
+| ⑨ | 代替案：全件同期 MERGE（公開テーブルを作り直さない） | ○ |
+| ⑩ | 代替案：差分更新 MERGE × 通常の長時間 SELECT | ○ |
+
+### 参考：SQL Server 2022（Docker・30 万行）での実行結果
+
+| 方式 | RCSI | 更新 | 後から来た読み取りの待ち |
+| --- | --- | --- | --- |
+| 現行 DROP + RENAME | OFF | タイムアウト（LCK_M_X） | 約 25 秒 |
+| ALTER VIEW | OFF / ON | タイムアウト（LCK_M_SCH_M） | 約 25 秒 |
+| SWITCH（通常の優先度） | OFF | タイムアウト（LCK_M_SCH_M） | 約 25 秒 |
+| SWITCH（低優先度 1 分 / SELF） | OFF | 読取1 の終了を待って成功（約 50 秒待機、LCK_M_SCH_M_LOW_PRIORITY） | なし |
+| SWITCH（低優先度・読取1 が 120 秒） | ON | 1 分で切替を中止（エラー 1222） | なし |
+| 制御テーブル切替 × 2 回更新 | OFF | 成功。ただし 2 回目の DELETE が読取1 を約 36 秒待機（LCK_M_X） | なし |
+| 制御テーブル切替 × 2 回更新 | ON | 待機なしで成功 | なし |
+| 全件同期 MERGE（約 6 万行 UPDATE） | ON | 待機なしで成功（MERGE 約 1.5 秒） | なし |
+| 差分更新 MERGE | ON | 待機なしで成功 | なし |
+
+Read Replica（Always On の読み取り可能セカンダリ）は単一サーバーでは再現できないため、このアプリでは検証対象外です。
+セカンダリでも DDL を再生する redo スレッドは実行中の SELECT の Sch-S を待つため（redo がブロックされ、セカンダリの反映が遅れる）、DDL で入れ替える方式のままでは問題が残ります。
 
 ## 検証ログ
 
@@ -72,7 +110,7 @@ SQL Server のデータ公開システムで発生する **全件更新時のロ
 }
 ```
 
-必要な権限（検証用 DB）：テーブル・ビュー・シノニムの作成/削除、`VIEW SERVER STATE`（ブロッキング監視用）。
+必要な権限（検証用 DB）：テーブル・ビュー・シノニムの作成/削除、`VIEW SERVER STATE`（ブロッキング監視用）、`ALTER DATABASE`（RCSI を切り替える場合のみ）、`ALTER ANY CONNECTION`（SWITCH の `ABORT_AFTER_WAIT = BLOCKERS` を使う場合のみ）。
 
 ```sql
 GRANT VIEW SERVER STATE TO [ログイン名];  -- SQL Server 2022 以降は VIEW SERVER PERFORMANCE STATE でも可

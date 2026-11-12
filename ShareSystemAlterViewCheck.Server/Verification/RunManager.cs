@@ -145,6 +145,15 @@ public sealed class RunManager(
                 ctx.Mutate(r => r.ServerInfo = info);
                 ctx.Info(SystemActor, $"接続先: {info}");
 
+                var rcsi = await DbObjects.GetReadCommittedSnapshotAsync(conn, ct);
+                ctx.Mutate(r => r.ReadCommittedSnapshot = rcsi);
+                ctx.Info(SystemActor, $"READ_COMMITTED_SNAPSHOT（RCSI）: {(rcsi == true ? "ON（読み取りは行バージョンを読み、S ロックを取らない）" : "OFF（読み取りは S ロックを取る）")}");
+                if (rcsi != true && (req.Mode == PublishMode.Control || req.UpdateType is UpdateType.Diff or UpdateType.FullSync))
+                {
+                    ctx.Warn(SystemActor, "この方式は RCSI が ON の前提です。OFF のままだと、DML（UPDATE/DELETE/MERGE）と読み取りの S ロックが互いに待ち合います",
+                        "「環境セットアップ」タブで READ_COMMITTED_SNAPSHOT を ON にできます。");
+                }
+
                 if (await DbObjects.GetActiveTableAsync(conn, req.Mode, ct) is null ||
                     !await ExistsAsync(conn, DbObjects.PublicObjectOf(req.Mode), ct))
                 {
@@ -273,6 +282,12 @@ public sealed class RunManager(
             summary.Verdict = "検証不成立 — 切替の時点で実行中の読み取りがありませんでした（読み取りの開始タイミング・継続時間を見直してください）";
             summary.VerdictLevel = "Warn";
         }
+        else if (summary.TimeoutCount > 0 && summary.Readers.Count > 1 && summary.ReaderMaxBlockedMs < 1000)
+        {
+            // 低優先度の SWITCH が待機時間切れで中止した場合など：更新は失敗したが、読み取りには影響していない
+            summary.Verdict = $"更新は待機時間切れで中止（{summary.TimeoutCount}件）— 後から来た読み取りは待たされませんでした（更新はやり直しが必要）";
+            summary.VerdictLevel = "Warn";
+        }
         else if (summary.TimeoutCount > 0)
         {
             summary.Verdict = $"更新がタイムアウトしました（{summary.TimeoutCount}件）— ロック問題が発生{readerNote}";
@@ -282,6 +297,11 @@ public sealed class RunManager(
         {
             summary.Verdict = $"エラーが発生しました（{summary.ErrorCount}件）{readerNote}";
             summary.VerdictLevel = "Error";
+        }
+        else if (updaterMaxBlocked >= 1000 && summary.ReaderMaxBlockedMs < 1000 && summary.Readers.Count > 1)
+        {
+            summary.Verdict = $"更新は読み取りの終了を待って成功（最大 {updaterMaxBlocked:N0}ms 待機）— 後から来た読み取りは待たされませんでした";
+            summary.VerdictLevel = "Warn";
         }
         else if (updaterMaxBlocked >= 1000)
         {
@@ -313,6 +333,7 @@ public sealed class RunManager(
         req.LockTimeoutMs = Math.Max(-1, req.LockTimeoutMs);
         req.DiffRowCount = Math.Clamp(req.DiffRowCount, 1, 1_000_000);
         req.MonitorIntervalMs = Math.Clamp(req.MonitorIntervalMs, 100, 10_000);
+        req.LowPriorityMaxMinutes = Math.Clamp(req.LowPriorityMaxMinutes, 1, 60);
         foreach (var r in req.Readers)
         {
             r.StartDelaySec = Math.Clamp(r.StartDelaySec, 0, 3600);
@@ -327,9 +348,16 @@ public sealed class RunManager(
         {
             PublishMode.Table => "テーブル公開",
             PublishMode.View => "ビュー公開",
+            PublishMode.Switch => "SWITCH",
+            PublishMode.Control => "制御テーブル切替",
             _ => "シノニム公開",
         };
-        var type = req.UpdateType == UpdateType.Full ? "全件更新" : "差分更新";
+        var type = req.UpdateType switch
+        {
+            UpdateType.Full => "全件更新",
+            UpdateType.Diff => "差分更新",
+            _ => "全件同期MERGE",
+        };
         return $"{mode} × {type} × 読取{req.Readers.Count}件";
     }
 
@@ -338,14 +366,20 @@ public sealed class RunManager(
         var lines = new List<string>
         {
             $"公開方式       : {UpdaterWorker.ModeText(req.Mode)}",
-            $"更新種別       : {(req.UpdateType == UpdateType.Full ? "全件更新" : $"差分更新（{req.DiffRowCount:N0}行）")}",
+            $"更新種別       : {UpdaterWorker.UpdateTypeText(req.UpdateType)}{(req.UpdateType == UpdateType.Diff ? $"（{req.DiffRowCount:N0}行）" : "")}",
             $"更新開始       : {req.UpdaterStartDelaySec}秒後 × {req.UpdateCount}回（間隔 {req.UpdateIntervalSec}秒）",
             $"CommandTimeout : {req.CommandTimeoutSec}秒",
             $"LOCK_TIMEOUT   : {(req.LockTimeoutMs < 0 ? "無制限(-1)" : req.LockTimeoutMs + "ms")}",
         };
-        if (req.Mode != PublishMode.Table && req.UpdateType == UpdateType.Full)
+        if (req.Mode is PublishMode.View or PublishMode.Synonym or PublishMode.Control && req.UpdateType == UpdateType.Full)
         {
             lines.Add($"非アクティブ準備: {req.InactivePrep}");
+        }
+        if (req.Mode == PublishMode.Switch && req.UpdateType == UpdateType.Full)
+        {
+            lines.Add(req.SwitchLowPriority
+                ? $"SWITCH 低優先度: WAIT_AT_LOW_PRIORITY (MAX_DURATION = {req.LowPriorityMaxMinutes} MINUTES, ABORT_AFTER_WAIT = {req.LowPriorityAbort.ToString().ToUpperInvariant()})"
+                : "SWITCH 低優先度: なし（通常の優先度で待機）");
         }
         lines.Add($"監視間隔       : {req.MonitorIntervalMs}ms");
         for (var i = 0; i < req.Readers.Count; i++)
@@ -355,6 +389,7 @@ public sealed class RunManager(
             {
                 ReaderTrigger.BeforeSwitch => $"更新{r.TriggerUpdate}の切替{r.StartDelaySec}秒前に開始",
                 ReaderTrigger.SwitchBlocked => $"更新{r.TriggerUpdate}の切替がロック待機になって{r.StartDelaySec}秒後に開始",
+                ReaderTrigger.SwitchStarted => $"更新{r.TriggerUpdate}の切替開始から{r.StartDelaySec}秒後に開始",
                 _ => $"検証開始{r.StartDelaySec}秒後に開始",
             };
             lines.Add($"Reader{i + 1,-9}: {ReaderWorker.KindText(r.Kind)} / {when} / {r.DurationSec}秒間");

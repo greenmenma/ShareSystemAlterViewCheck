@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { api } from '../api';
-import { dateTime, modeShort, ms, statusLabel, updateTypeLabel } from '../format';
+import { dateTime, modeShort, ms, statusLabel, updateTypeShort } from '../format';
 import type { RunListItem } from '../types';
 import RunDetail from './RunDetail';
 
@@ -67,7 +67,8 @@ export default function RunLogs({ selectedId, onSelect }: Props) {
                                 {x.kind === 'Verification' && (
                                     <div className="run-item-tags">
                                         {x.mode && <span className={`tag tag-${x.mode.toLowerCase()}`}>{modeShort[x.mode]}</span>}
-                                        {x.updateType && <span className="tag">{updateTypeLabel[x.updateType]}</span>}
+                                        {x.updateType && <span className="tag">{updateTypeShort[x.updateType]}</span>}
+                                        {x.readCommittedSnapshot != null && <span className="tag">RCSI {x.readCommittedSnapshot ? 'ON' : 'OFF'}</span>}
                                         <span className="tag">最大待機 {ms(x.maxBlockedMs)}</span>
                                     </div>
                                 )}

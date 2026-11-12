@@ -25,6 +25,13 @@ public static class ApiEndpoints
             return ctx is null ? Results.Conflict(new { message = error }) : Results.Ok(new { id = ctx.Record.Id });
         });
 
+        // READ_COMMITTED_SNAPSHOT（RCSI）の切替
+        api.MapPost("/environment/rcsi", (RcsiRequest req, SetupService setup) =>
+        {
+            var (ctx, error) = setup.StartSetRcsi(req.Enabled);
+            return ctx is null ? Results.Conflict(new { message = error }) : Results.Ok(new { id = ctx.Record.Id });
+        });
+
         // 検証ログ一覧
         api.MapGet("/runs", (RunStore store, RunManager manager) =>
         {

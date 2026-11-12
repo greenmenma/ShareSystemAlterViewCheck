@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { api } from '../api';
 import {
-    actorLabel, dateTime, downloadText, modeLabel, ms, readerKindLabel, readerWhen, statusLabel, updateTypeLabel,
+    actorLabel, dateTime, downloadText, lowPriorityAbortLabel, modeLabel, ms, readerKindLabel, readerWhen, statusLabel, updateTypeLabel,
 } from '../format';
 import type { RunRecord } from '../types';
 import EventLog from './EventLog';
@@ -133,7 +133,13 @@ export default function RunDetail({ id, onDeleted }: Props) {
                         <span><b>更新</b>{req.updaterStartDelaySec}秒後 × {req.updateCount}回{req.updateCount > 1 ? `（間隔${req.updateIntervalSec}秒）` : ''}</span>
                         <span><b>CommandTimeout</b>{req.commandTimeoutSec}秒</span>
                         <span><b>LOCK_TIMEOUT</b>{req.lockTimeoutMs < 0 ? '無制限' : `${req.lockTimeoutMs}ms`}</span>
-                        {req.mode !== 'Table' && req.updateType === 'Full' && <span><b>非アクティブ準備</b>{req.inactivePrep}</span>}
+                        {run.readCommittedSnapshot != null && <span><b>RCSI</b>{run.readCommittedSnapshot ? 'ON' : 'OFF'}</span>}
+                        {['View', 'Synonym', 'Control'].includes(req.mode) && req.updateType === 'Full' && <span><b>非アクティブ準備</b>{req.inactivePrep}</span>}
+                        {req.mode === 'Switch' && req.updateType === 'Full' && (
+                            <span><b>SWITCH 低優先度</b>{req.switchLowPriority === false
+                                ? 'なし'
+                                : `MAX_DURATION ${req.lowPriorityMaxMinutes ?? 1}分 / ${lowPriorityAbortLabel[req.lowPriorityAbort ?? 'Self'].split('（')[0]}`}</span>
+                        )}
                         {req.readers.map((r, i) => (
                             <span key={i}><b>読取{i + 1}</b>{readerKindLabel[r.kind].split('（')[0]} / {readerWhen(r)} / {r.durationSec}秒間</span>
                         ))}

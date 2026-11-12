@@ -1,23 +1,27 @@
 import { useState } from 'react';
 import { api } from '../api';
-import { modeLabel, readerKindLabel, readerTriggerLabel, updateTypeLabel } from '../format';
-import type { EnvironmentStatus, InactivePrep, PublishMode, ReaderKind, ReaderSpec, ReaderTrigger, RunRequest, UpdateType } from '../types';
+import { lowPriorityAbortLabel, modeLabel, readerKindLabel, readerTriggerLabel, updateTypeLabel } from '../format';
+import type { EnvironmentStatus, InactivePrep, LowPriorityAbort, PublishMode, ReaderKind, ReaderSpec, ReaderTrigger, RunRequest, UpdateType } from '../types';
 
 interface Preset {
     key: string;
+    group: 'current' | 'alternative';
     title: string;
     expect: string;
     expectLevel: 'error' | 'success' | 'warn';
+    /** RCSI（READ_COMMITTED_SNAPSHOT）が ON である前提か */
+    needsRcsi?: boolean;
     description: string;
     request: RunRequest;
 }
 
 // 検証したいパターン：
-//   読取1 が切替の 10 秒前から読み続ける → 切替（DROP/ALTER）がロック待機 → 待機中に読取2 が新たに SELECT
+//   読取1 が切替の 10 秒前から読み続ける → 切替（DROP/ALTER/SWITCH/UPDATE/MERGE）
+//   → 切替の開始から 5 秒後に読取2 が新たに SELECT（切替が待機していれば、その後ろで待たされるか）
 // 開始タイミングは更新処理のイベントに連動するので、BulkCopy の速さに関係なく必ずこの順序になる
 const blockingReaders: ReaderSpec[] = [
     { kind: 'SlowRead', trigger: 'BeforeSwitch', triggerUpdate: 1, startDelaySec: 10, durationSec: 60 },
-    { kind: 'SlowRead', trigger: 'SwitchBlocked', triggerUpdate: 1, startDelaySec: 5, durationSec: 10 },
+    { kind: 'SlowRead', trigger: 'SwitchStarted', triggerUpdate: 1, startDelaySec: 5, durationSec: 10 },
 ];
 
 const base: RunRequest = {
@@ -32,37 +36,43 @@ const base: RunRequest = {
     inactivePrep: 'Truncate',
     diffRowCount: 1000,
     monitorIntervalMs: 500,
+    switchLowPriority: true,
+    lowPriorityMaxMinutes: 1,
+    lowPriorityAbort: 'Self',
 };
 
 const presets: Preset[] = [
     {
         key: 'current',
+        group: 'current',
         title: '① 現行方式の再現',
         expect: 'タイムアウト想定',
         expectLevel: 'error',
         description:
-            '読取1 が切替の 10 秒前から公開テーブルを 60 秒読み続け、DROP TABLE がロック待機（LCK_M_SCH_M）。待機になって 5 秒後に読取2 が新たに SELECT し、読取2 も DROP の後ろで待たされる（LCK_M_SCH_S）ことと、CommandTimeout(30秒) で更新が失敗する現象を再現します。',
+            '読取1 が切替の 10 秒前から公開テーブルを 60 秒読み続け、DROP TABLE がロック待機（LCK_M_SCH_M）。切替開始の 5 秒後に来た読取2 も DROP の後ろで待たされる（LCK_M_SCH_S）ことと、CommandTimeout(30秒) で更新が失敗する現象を再現します。',
         request: { ...base, title: '① 現行: テーブル公開 × 長時間SELECT', mode: 'Table' },
     },
     {
         key: 'view',
-        title: '② 改修後（ALTER VIEW）',
-        expect: '改修方式の検証',
-        expectLevel: 'warn',
+        group: 'current',
+        title: '② 改修案（ALTER VIEW）',
+        expect: '解消しない',
+        expectLevel: 'error',
         description:
-            '①と同じ読み取りパターンをビュー公開で実行。非アクティブ側へ BulkCopy した後 ALTER VIEW で切り替えます。読み取り中のビューに対する ALTER VIEW が待機するか、待機中に来た読取2 が止まるかを確認します。',
-        request: { ...base, title: '② 改修後: ビュー公開 × 長時間SELECT', mode: 'View' },
+            '①と同じ読み取りパターンをビュー公開で実行。ALTER VIEW もビューに Sch-M ロックが必要なため、読み取り中は待機し、後から来た読取2 も待たされることを確認します。',
+        request: { ...base, title: '② 改修案: ビュー公開 × 長時間SELECT', mode: 'View' },
     },
     {
         key: 'view-twice',
-        title: '③ 改修後・連続切替',
+        group: 'current',
+        title: '③ 改修案・連続切替',
         expect: '注意点の確認',
         expectLevel: 'warn',
         description:
             '90 秒の読み取り中に 20 秒間隔で 2 回更新。2 回目は「読み取り中の旧テーブル」を TRUNCATE するため、Blue/Green でも待機が起きうるケースを確認します。',
         request: {
             ...base,
-            title: '③ 改修後: ビュー公開 × 連続2回切替',
+            title: '③ 改修案: ビュー公開 × 連続2回切替',
             mode: 'View',
             readers: [{ kind: 'SlowRead', trigger: 'RunStart', startDelaySec: 0, durationSec: 90 }],
             updateCount: 2,
@@ -71,19 +81,21 @@ const presets: Preset[] = [
     },
     {
         key: 'synonym',
+        group: 'current',
         title: '④ 参考：シノニム',
-        expect: '比較用',
-        expectLevel: 'warn',
+        expect: '解消しない',
+        expectLevel: 'error',
         description: 'DROP SYNONYM / CREATE SYNONYM による切替を①②と同じ読み取りパターンで実行し、ALTER VIEW と比較します。',
         request: { ...base, title: '④ 参考: シノニム公開 × 長時間SELECT', mode: 'Synonym' },
     },
     {
         key: 'diff',
-        title: '⑤ 差分更新（MERGE）',
+        group: 'current',
+        title: '⑤ 差分更新 × HOLDLOCK',
         expect: '待機の確認',
         expectLevel: 'warn',
         description:
-            'MERGE の 10 秒前から読取1 が HOLDLOCK でテーブルロックを 40 秒保持。MERGE のロック待機と、待機中に来た読取2 の待機を確認します。',
+            'MERGE の 10 秒前から読取1 が HOLDLOCK でテーブルロックを 40 秒保持。HOLDLOCK（SERIALIZABLE）は RCSI でもロックを取るため、RCSI の ON/OFF に関係なく MERGE が待機することを確認します。',
         request: {
             ...base,
             title: '⑤ 差分更新 × HOLDLOCK',
@@ -91,9 +103,77 @@ const presets: Preset[] = [
             updateType: 'Diff',
             readers: [
                 { kind: 'HoldLock', trigger: 'BeforeSwitch', triggerUpdate: 1, startDelaySec: 10, durationSec: 40 },
-                { kind: 'SlowRead', trigger: 'SwitchBlocked', triggerUpdate: 1, startDelaySec: 5, durationSec: 10 },
+                { kind: 'SlowRead', trigger: 'SwitchStarted', triggerUpdate: 1, startDelaySec: 5, durationSec: 10 },
             ],
         },
+    },
+    {
+        key: 'switch-low',
+        group: 'alternative',
+        title: '⑥ SWITCH + 低優先度待機',
+        expect: '読み取りは止まらない',
+        expectLevel: 'success',
+        description:
+            '公開テーブルはそのまま、新データを別テーブルへ BulkCopy して ALTER TABLE SWITCH で入れ替えます。WAIT_AT_LOW_PRIORITY を付けると、切替は読取1 の終了を待ちますが、後から来た読取2 は切替を追い越して読めます。読取1 の終了後に切替が成功します。',
+        request: { ...base, title: '⑥ 代替: SWITCH 低優先度 × 長時間SELECT', mode: 'Switch' },
+    },
+    {
+        key: 'switch-abort',
+        group: 'alternative',
+        title: '⑦ SWITCH 低優先度・時間切れ',
+        expect: '更新をあきらめる',
+        expectLevel: 'warn',
+        description:
+            '読取1 が 120 秒続く場合。低優先度で 1 分待っても読み取りが終わらないので、ABORT_AFTER_WAIT = SELF で切替をあきらめます（エラー 1222）。読み取りは止まらず、更新は後でやり直せる状態で終わることを確認します。',
+        request: {
+            ...base,
+            title: '⑦ 代替: SWITCH 低優先度 × 120秒SELECT（時間切れ）',
+            mode: 'Switch',
+            readers: [
+                { kind: 'SlowRead', trigger: 'BeforeSwitch', triggerUpdate: 1, startDelaySec: 10, durationSec: 120 },
+                { kind: 'SlowRead', trigger: 'SwitchStarted', triggerUpdate: 1, startDelaySec: 5, durationSec: 10 },
+            ],
+        },
+    },
+    {
+        key: 'control',
+        group: 'alternative',
+        title: '⑧ 制御テーブル切替（DDL なし）',
+        expect: '解消見込み',
+        expectLevel: 'success',
+        needsRcsi: true,
+        description:
+            'ビュー定義は固定し、制御テーブルの値（UPDATE）で A/B を切り替えます。DDL を使わないので Sch-M ロックが発生しません。2 回目の更新では読取1 が読んでいる側を DELETE して入れ替えます（RCSI なら読取1 は更新前の行を読み続けます）。',
+        request: {
+            ...base,
+            title: '⑧ 代替: 制御テーブル切替 × 長時間SELECT × 2回更新',
+            mode: 'Control',
+            inactivePrep: 'Delete',
+            updateCount: 2,
+            updateIntervalSec: 30,
+        },
+    },
+    {
+        key: 'fullsync',
+        group: 'alternative',
+        title: '⑨ 全件同期 MERGE（作り直さない）',
+        expect: '解消見込み',
+        expectLevel: 'success',
+        needsRcsi: true,
+        description:
+            '公開テーブルを作り直さず、全件をステージングへ取得して MERGE（変わった行の UPDATE・INSERT・DELETE）で反映します。DDL がないので Sch-M は不要。RCSI なら読み取りは更新前の行を読み、MERGE と互いに待ちません。',
+        request: { ...base, title: '⑨ 代替: 全件同期 MERGE × 長時間SELECT', mode: 'Table', updateType: 'FullSync' },
+    },
+    {
+        key: 'diff-rcsi',
+        group: 'alternative',
+        title: '⑩ 差分更新 MERGE × 通常の SELECT',
+        expect: '解消見込み',
+        expectLevel: 'success',
+        needsRcsi: true,
+        description:
+            '差分更新（MERGE）中に通常の長時間 SELECT を実行。RCSI が ON なら待機なし、OFF なら MERGE と読み取りの S ロックが待ち合うことを比較できます。',
+        request: { ...base, title: '⑩ 代替: 差分更新 MERGE × 長時間SELECT', mode: 'Table', updateType: 'Diff' },
     },
 ];
 
@@ -128,7 +208,10 @@ export default function RunForm({ env, onStarted }: Props) {
         }
     };
 
-    const blueGreen = req.mode !== 'Table' && req.updateType === 'Full';
+    const blueGreen = ['View', 'Synonym', 'Control'].includes(req.mode) && req.updateType === 'Full';
+    const switchFull = req.mode === 'Switch' && req.updateType === 'Full';
+    const needsRcsi = req.mode === 'Control' || req.updateType === 'FullSync' || req.updateType === 'Diff';
+    const rcsi = env?.readCommittedSnapshot;
     const totalSec = Math.max(
         ...req.readers.map((r) => ((r.trigger ?? 'RunStart') === 'RunStart' ? r.startDelaySec : req.updaterStartDelaySec) + r.durationSec),
         req.updaterStartDelaySec + (req.updateCount - 1) * req.updateIntervalSec + req.commandTimeoutSec,
@@ -152,21 +235,34 @@ export default function RunForm({ env, onStarted }: Props) {
                     <h2>シナリオ（プリセット）</h2>
                     <span className="hint">選択すると下の条件に反映されます。条件は自由に変更できます。</span>
                 </div>
-                <div className="presets">
-                    {presets.map((p) => (
-                        <button
-                            key={p.key}
-                            className={`preset ${presetKey === p.key ? 'selected' : ''}`}
-                            onClick={() => applyPreset(p)}
-                        >
-                            <div className="preset-head">
-                                <strong>{p.title}</strong>
-                                <span className={`pill pill-${p.expectLevel}`}>{p.expect}</span>
-                            </div>
-                            <p>{p.description}</p>
-                        </button>
-                    ))}
-                </div>
+                {([
+                    ['current', '現状と改修案（ALTER VIEW）'],
+                    ['alternative', '代替案（ロック回避の候補）'],
+                ] as const).map(([group, label]) => (
+                    <div key={group}>
+                        <h3>{label}</h3>
+                        <div className="presets">
+                            {presets.filter((p) => p.group === group).map((p) => (
+                                <button
+                                    key={p.key}
+                                    className={`preset ${presetKey === p.key ? 'selected' : ''}`}
+                                    onClick={() => applyPreset(p)}
+                                >
+                                    <div className="preset-head">
+                                        <strong>{p.title}</strong>
+                                        <span className={`pill pill-${p.expectLevel}`}>{p.expect}</span>
+                                        {p.needsRcsi && <span className={`pill ${rcsi ? 'pill-success' : 'pill-warn'}`}>RCSI 前提</span>}
+                                    </div>
+                                    <p>{p.description}</p>
+                                </button>
+                            ))}
+                        </div>
+                    </div>
+                ))}
+                <p className="hint">
+                    現在の READ_COMMITTED_SNAPSHOT（RCSI）: <strong>{rcsi == null ? '不明' : rcsi ? 'ON' : 'OFF'}</strong>
+                    （「環境セットアップ」タブで切り替えられます。「RCSI 前提」のシナリオは ON と OFF の両方で実行すると違いが分かります）
+                </p>
             </section>
 
             <section className="card">
@@ -174,6 +270,11 @@ export default function RunForm({ env, onStarted }: Props) {
                     <h2>検証条件</h2>
                 </div>
 
+                {needsRcsi && rcsi === false && (
+                    <div className="alert alert-warn">
+                        この方式は RCSI が ON である前提です。現在は OFF のため、DML と読み取りの S ロックが互いに待ち合う結果になります（比較のために OFF で実行するのは問題ありません）。
+                    </div>
+                )}
                 <div className="form-grid">
                     <label className="span-2">
                         タイトル
@@ -227,6 +328,29 @@ export default function RunForm({ env, onStarted }: Props) {
                             <option value="Truncate">TRUNCATE TABLE</option>
                             <option value="DropCreate">DROP + CREATE TABLE</option>
                             <option value="Delete">DELETE FROM</option>
+                        </select>
+                    </label>
+                    <label>
+                        SWITCH の低優先度待機
+                        <select value={req.switchLowPriority === false ? 'off' : 'on'} disabled={!switchFull}
+                            onChange={(e) => set('switchLowPriority', e.target.value === 'on')}>
+                            <option value="on">WAIT_AT_LOW_PRIORITY を付ける</option>
+                            <option value="off">付けない（通常の優先度で待機）</option>
+                        </select>
+                    </label>
+                    <label>
+                        低優先度の最大待機（分）
+                        <input type="number" min={1} max={60} value={req.lowPriorityMaxMinutes ?? 1}
+                            disabled={!switchFull || req.switchLowPriority === false}
+                            onChange={(e) => set('lowPriorityMaxMinutes', Number(e.target.value))} />
+                    </label>
+                    <label>
+                        待機時間を過ぎたら（ABORT_AFTER_WAIT）
+                        <select value={req.lowPriorityAbort ?? 'Self'} disabled={!switchFull || req.switchLowPriority === false}
+                            onChange={(e) => set('lowPriorityAbort', e.target.value as LowPriorityAbort)}>
+                            {(Object.keys(lowPriorityAbortLabel) as LowPriorityAbort[]).map((k) => (
+                                <option key={k} value={k}>{lowPriorityAbortLabel[k]}</option>
+                            ))}
                         </select>
                     </label>
                     <label>
@@ -310,7 +434,8 @@ export default function RunForm({ env, onStarted }: Props) {
                 </div>
                 <p className="hint">
                     「切替の N 秒前」は、更新処理が BulkCopy を終えたところで読み取りを開始し、読み取り中になったのを確認してから N 秒後に切替えます（N は継続時間より短くしてください。0 なら 0.5 秒後）。
-                    「切替がロック待機になってから」は、ロック監視が切替の待機を検出してから N 秒後に開始します（検出できない場合は切替開始から 3 秒で待機中とみなします）。
+                    「切替がロック待機になってから」は、ロック監視が切替の待機を検出してから N 秒後に開始します（検出できない場合は切替開始から 3 秒で待機中とみなします）。待機しなかった場合は実行しません。
+                    「切替の開始から」は、待機の有無に関係なく切替 SQL の開始から N 秒後に開始します（方式どうしを同じ条件で比べるときに使います）。
                 </p>
                 <button className="btn btn-small" onClick={() =>
                     set('readers', [...req.readers, { kind: 'SlowRead', trigger: 'RunStart', triggerUpdate: 1, startDelaySec: 0, durationSec: 60 }])}>
@@ -330,6 +455,12 @@ export default function RunForm({ env, onStarted }: Props) {
 
             <section className="card explain">
                 <h2>方式の説明</h2>
+                <p className="hint">
+                    DROP / sp_rename / ALTER VIEW / シノニムの作り直し / ALTER TABLE SWITCH は、いずれも対象に Sch-M（スキーマ変更）ロックが必要です。
+                    実行中の SELECT は最後まで Sch-S（スキーマ安定）ロックを持つため、DDL で入れ替える方式は「読み取りが終わるまで待つ」ことを避けられません。
+                    違いが出るのは「待っている間に後から来た SELECT まで止めるか」と「待ちきれないときにどう終わるか」です。
+                    DDL を使わない（DML だけで入れ替える）方式なら Sch-M が不要になり、RCSI と組み合わせると読み取りと更新が互いに待たなくなります。
+                </p>
                 <div className="explain-grid">
                     <div>
                         <h4>現行：テーブル公開</h4>
@@ -338,23 +469,56 @@ export default function RunForm({ env, onStarted }: Props) {
                             <li>vt_Source から BulkCopy</li>
                             <li><code>DROP TABLE vt_PublicTable</code> + <code>sp_rename</code></li>
                         </ol>
-                        <p>DROP は Sch-M ロックが必要なため、読み取り中（Sch-S/S 保持）だと待機します。</p>
+                        <p>DROP は Sch-M が必要。読み取り中は待機し、待機中に来た SELECT もその後ろで止まります。</p>
                     </div>
                     <div>
-                        <h4>改修後：ビュー公開（Blue/Green）</h4>
+                        <h4>改修案：ビュー公開（ALTER VIEW）</h4>
                         <ol>
                             <li>非アクティブ側（Blue/Green）を空にする</li>
                             <li>vt_Source から BulkCopy</li>
                             <li><code>ALTER VIEW vt_PublicView AS SELECT … FROM 非アクティブ側</code></li>
                         </ol>
-                        <p>読み取りはアクティブ側を参照し続け、更新は非アクティブ側に対して行います。</p>
+                        <p>ALTER VIEW もビューに Sch-M が必要なため、ビューを読み取り中だと現行と同じく待機します。</p>
                     </div>
                     <div>
-                        <h4>差分更新</h4>
+                        <h4>代替案：ALTER TABLE SWITCH（低優先度）</h4>
+                        <ol>
+                            <li>vt_SwStage へ BulkCopy</li>
+                            <li><code>ALTER TABLE vt_SwPublic SWITCH TO vt_SwOld WITH (WAIT_AT_LOW_PRIORITY …)</code></li>
+                            <li><code>ALTER TABLE vt_SwStage SWITCH TO vt_SwPublic</code></li>
+                        </ol>
+                        <p>
+                            切替は読み取りの終了を待ちますが、低優先度の待機は後から来た SELECT を止めません。
+                            待機時間を過ぎたら、あきらめる（SELF）か、読み取りを強制終了する（BLOCKERS）かを選べます。公開名はテーブルのままで済みます。
+                        </p>
+                    </div>
+                    <div>
+                        <h4>代替案：制御テーブル切替（DDL なし）</h4>
+                        <ol>
+                            <li>非アクティブ側（A/B）を DELETE で空にする</li>
+                            <li>vt_Source から BulkCopy</li>
+                            <li><code>UPDATE vt_CtlActive SET ActiveSide = 'B'</code></li>
+                        </ol>
+                        <p>
+                            ビュー vt_CtlView は制御テーブルの値で A/B の片側だけを読む固定定義です。切替は DML なので Sch-M が不要。
+                            非アクティブ側を TRUNCATE すると Sch-M が必要になるため DELETE を使います。RCSI 前提です。
+                        </p>
+                    </div>
+                    <div>
+                        <h4>代替案：全件同期 MERGE</h4>
+                        <ol>
+                            <li>vt_DiffStage へ全件を BulkCopy</li>
+                            <li><code>MERGE</code> で変わった行の UPDATE・INSERT・連携元に無い行の DELETE</li>
+                        </ol>
+                        <p>公開テーブルを作り直さないので DDL がありません。RCSI なら読み取りは更新前の行を読み続けます。ログ量と MERGE の時間は増えます。</p>
+                    </div>
+                    <div>
+                        <h4>差分更新（MERGE）</h4>
                         <ol>
                             <li>vt_DiffStage を作成し差分を BulkCopy</li>
-                            <li><code>MERGE</code> で公開テーブル（ビュー方式はアクティブ側）へ反映</li>
+                            <li><code>MERGE</code> で公開テーブル（Blue/Green 方式はアクティブ側）へ反映</li>
                         </ol>
+                        <p>RCSI が OFF だと S ロックと X ロックが待ち合います。HOLDLOCK などのロックヒントは RCSI でもロックを取ります。</p>
                     </div>
                 </div>
             </section>

@@ -24,6 +24,8 @@ export const api = {
     environment: () => request<EnvironmentStatus>('environment'),
     setup: (rowCount: number) =>
         request<{ id: string }>('environment/setup', { method: 'POST', body: JSON.stringify({ rowCount }) }),
+    setRcsi: (enabled: boolean) =>
+        request<{ id: string }>('environment/rcsi', { method: 'POST', body: JSON.stringify({ enabled }) }),
     drop: () => request<{ id: string }>('environment/drop', { method: 'POST' }),
     runs: () => request<RunListItem[]>('runs'),
     run: (id: string) => request<RunRecord>(`runs/${encodeURIComponent(id)}`),

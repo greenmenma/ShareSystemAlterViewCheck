@@ -1,9 +1,10 @@
 // サーバー側 Verification/Models.cs に対応する型
 
-export type PublishMode = 'Table' | 'View' | 'Synonym';
-export type UpdateType = 'Full' | 'Diff';
+export type PublishMode = 'Table' | 'View' | 'Synonym' | 'Switch' | 'Control';
+export type UpdateType = 'Full' | 'Diff' | 'FullSync';
+export type LowPriorityAbort = 'None' | 'Self' | 'Blockers';
 export type ReaderKind = 'SlowRead' | 'HoldLock' | 'HeavyQuery';
-export type ReaderTrigger = 'RunStart' | 'BeforeSwitch' | 'SwitchBlocked';
+export type ReaderTrigger = 'RunStart' | 'BeforeSwitch' | 'SwitchBlocked' | 'SwitchStarted';
 export type InactivePrep = 'Truncate' | 'DropCreate' | 'Delete';
 export type RunStatus = 'Running' | 'Completed' | 'Cancelled' | 'Failed' | 'Aborted';
 export type RunKind = 'Verification' | 'Setup';
@@ -33,6 +34,10 @@ export interface RunRequest {
     inactivePrep: InactivePrep;
     diffRowCount: number;
     monitorIntervalMs: number;
+    /** SWITCH 方式：WAIT_AT_LOW_PRIORITY を付けるか（古いログには無い） */
+    switchLowPriority?: boolean;
+    lowPriorityMaxMinutes?: number;
+    lowPriorityAbort?: LowPriorityAbort;
 }
 
 export interface RunEvent {
@@ -111,6 +116,7 @@ export interface RunRecord {
     status: RunStatus;
     request?: RunRequest | null;
     serverInfo?: string | null;
+    readCommittedSnapshot?: boolean | null;
     events: RunEvent[];
     phases: RunPhase[];
     summary?: RunSummary | null;
@@ -133,6 +139,7 @@ export interface RunListItem {
     errorCount: number;
     switchMs?: number | null;
     eventCount: number;
+    readCommittedSnapshot?: boolean | null;
 }
 
 export interface DbObjectInfo {
@@ -155,6 +162,9 @@ export interface EnvironmentStatus {
     isSetUp: boolean;
     activeViewTable?: string | null;
     activeSynonymTable?: string | null;
+    activeControlTable?: string | null;
+    readCommittedSnapshot?: boolean | null;
+    canAlterDatabase?: boolean;
     objects: DbObjectInfo[];
     runActive: boolean;
     activeRunId?: string | null;

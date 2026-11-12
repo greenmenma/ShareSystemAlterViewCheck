@@ -9,6 +9,10 @@ public enum PublishMode
     View,
     /// <summary>参考：シノニム公開（Blue/Green テーブル + DROP/CREATE SYNONYM）</summary>
     Synonym,
+    /// <summary>代替案：テーブル公開のまま ALTER TABLE SWITCH で入れ替え（WAIT_AT_LOW_PRIORITY 指定可）</summary>
+    Switch,
+    /// <summary>代替案：制御テーブル切替（ビュー定義は固定。制御テーブルの UPDATE で Blue/Green を切替える＝DDL なし）</summary>
+    Control,
 }
 
 /// <summary>更新種別</summary>
@@ -18,6 +22,19 @@ public enum UpdateType
     Full,
     /// <summary>差分更新（差分テーブル → MERGE）</summary>
     Diff,
+    /// <summary>全件同期（全件をステージングへ取得 → MERGE で INSERT/UPDATE/DELETE。テーブルの作り直しをやめる）</summary>
+    FullSync,
+}
+
+/// <summary>WAIT_AT_LOW_PRIORITY の ABORT_AFTER_WAIT</summary>
+public enum LowPriorityAbort
+{
+    /// <summary>待機時間を過ぎたら通常の優先度で待ち続ける</summary>
+    None,
+    /// <summary>待機時間を過ぎたら切替をあきらめる（エラー 1222）</summary>
+    Self,
+    /// <summary>待機時間を過ぎたらブロックしている読み取りを強制終了する</summary>
+    Blockers,
 }
 
 /// <summary>読み取り（重い SELECT）の種類</summary>
@@ -40,6 +57,8 @@ public enum ReaderTrigger
     BeforeSwitch,
     /// <summary>更新の切替がロック待機になってから StartDelaySec 秒後（待機中に後から来た SELECT を再現）</summary>
     SwitchBlocked,
+    /// <summary>更新の切替 SQL を開始してから StartDelaySec 秒後（待機の有無にかかわらず開始。方式間の比較用）</summary>
+    SwitchStarted,
 }
 
 /// <summary>Blue/Green 方式で非アクティブ側テーブルを空にする方法</summary>
@@ -112,6 +131,15 @@ public sealed class RunRequest
 
     /// <summary>差分更新の件数（半分を更新、半分を追加）</summary>
     public int DiffRowCount { get; set; } = 1000;
+
+    /// <summary>SWITCH 方式：WAIT_AT_LOW_PRIORITY を付けるか</summary>
+    public bool SwitchLowPriority { get; set; } = true;
+
+    /// <summary>SWITCH 方式：低優先度で待つ最大時間（分）</summary>
+    public int LowPriorityMaxMinutes { get; set; } = 1;
+
+    /// <summary>SWITCH 方式：低優先度の待機時間を過ぎたときの動作</summary>
+    public LowPriorityAbort LowPriorityAbort { get; set; } = LowPriorityAbort.Self;
 
     /// <summary>ロック監視の間隔（ミリ秒）</summary>
     public int MonitorIntervalMs { get; set; } = 500;
@@ -230,6 +258,10 @@ public sealed class RunRecord
     public RunStatus Status { get; set; } = RunStatus.Running;
     public RunRequest? Request { get; set; }
     public string? ServerInfo { get; set; }
+
+    /// <summary>検証開始時の READ_COMMITTED_SNAPSHOT（RCSI）の設定</summary>
+    public bool? ReadCommittedSnapshot { get; set; }
+
     public List<RunEvent> Events { get; set; } = [];
     public List<RunPhase> Phases { get; set; } = [];
     public RunSummary? Summary { get; set; }
@@ -254,6 +286,7 @@ public sealed class RunListItem
     public int ErrorCount { get; set; }
     public long? SwitchMs { get; set; }
     public int EventCount { get; set; }
+    public bool? ReadCommittedSnapshot { get; set; }
 
     public static RunListItem From(RunRecord r) => new()
     {
@@ -273,6 +306,7 @@ public sealed class RunListItem
         ErrorCount = r.Summary?.ErrorCount ?? 0,
         SwitchMs = r.Summary?.Updates.Where(u => u.SwitchMs.HasValue).Select(u => u.SwitchMs).Max(),
         EventCount = r.Events.Count,
+        ReadCommittedSnapshot = r.ReadCommittedSnapshot,
     };
 }
 
@@ -289,6 +323,14 @@ public sealed class EnvironmentStatus
     public bool IsSetUp { get; set; }
     public string? ActiveViewTable { get; set; }
     public string? ActiveSynonymTable { get; set; }
+    public string? ActiveControlTable { get; set; }
+
+    /// <summary>READ_COMMITTED_SNAPSHOT（RCSI）が ON か</summary>
+    public bool? ReadCommittedSnapshot { get; set; }
+
+    /// <summary>ALTER DATABASE の権限があるか（RCSI の切替に必要）</summary>
+    public bool CanAlterDatabase { get; set; }
+
     public List<DbObjectInfo> Objects { get; set; } = [];
     public bool RunActive { get; set; }
     public string? ActiveRunId { get; set; }
@@ -302,6 +344,11 @@ public sealed class DbObjectInfo
     public bool Exists { get; set; }
     public long? Rows { get; set; }
     public string? Definition { get; set; }
+}
+
+public sealed class RcsiRequest
+{
+    public bool Enabled { get; set; }
 }
 
 public sealed class SetupRequest

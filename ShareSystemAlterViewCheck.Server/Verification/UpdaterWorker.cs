@@ -8,7 +8,10 @@ namespace ShareSystemAlterViewCheck.Server.Verification;
 /// ・全件更新（テーブル公開）: 新テーブル作成 → BulkCopy → DROP 公開テーブル → RENAME
 /// ・全件更新（ビュー公開）  : 非アクティブ側を空にする → BulkCopy → ALTER VIEW
 /// ・全件更新（シノニム公開）: 非アクティブ側を空にする → BulkCopy → DROP/CREATE SYNONYM
+/// ・全件更新（SWITCH）      : 投入先へ BulkCopy → ALTER TABLE SWITCH で公開テーブルと入れ替え（低優先度待機を指定可）
+/// ・全件更新（制御テーブル）: 非アクティブ側を空にする → BulkCopy → 制御テーブルを UPDATE（DDL なし）
 /// ・差分更新                : 差分テーブル作成 → BulkCopy → MERGE
+/// ・全件同期                : 全件をステージングへ BulkCopy → MERGE（INSERT/UPDATE/DELETE）で公開テーブルへ反映
 /// </summary>
 public sealed class UpdaterWorker(RunContext ctx, string connectionString, RunRequest req)
 {
@@ -65,7 +68,7 @@ public sealed class UpdaterWorker(RunContext ctx, string connectionString, RunRe
     {
         var label = req.UpdateCount > 1 ? $"更新{result.Index}" : "更新";
         var total = Stopwatch.StartNew();
-        ctx.Info(Actor, $"{label}開始: {ModeText(req.Mode)} / {(req.UpdateType == UpdateType.Full ? "全件更新" : "差分更新")}");
+        ctx.Info(Actor, $"{label}開始: {ModeText(req.Mode)} / {UpdateTypeText(req.UpdateType)}");
 
         try
         {
@@ -75,17 +78,26 @@ public sealed class UpdaterWorker(RunContext ctx, string connectionString, RunRe
             using var session = ctx.Track(spid, Actor);
             ctx.Info(Actor, $"接続しました SPID={spid}");
 
-            if (req.UpdateType == UpdateType.Diff)
+            switch (req.UpdateType, req.Mode)
             {
-                await DiffAsync(conn, result, label, ct);
-            }
-            else if (req.Mode == PublishMode.Table)
-            {
-                await FullTableAsync(conn, result, label, ct);
-            }
-            else
-            {
-                await FullBlueGreenAsync(conn, result, label, ct);
+                case (UpdateType.Diff, _):
+                    await DiffAsync(conn, result, label, ct);
+                    break;
+                case (UpdateType.FullSync, _):
+                    await FullSyncAsync(conn, result, label, ct);
+                    break;
+                case (_, PublishMode.Table):
+                    await FullTableAsync(conn, result, label, ct);
+                    break;
+                case (_, PublishMode.Switch):
+                    await FullSwitchAsync(conn, result, label, ct);
+                    break;
+                case (_, PublishMode.Control):
+                    await FullControlAsync(conn, result, label, ct);
+                    break;
+                default:
+                    await FullBlueGreenAsync(conn, result, label, ct);
+                    break;
             }
 
             result.Success = true;
@@ -149,6 +161,33 @@ public sealed class UpdaterWorker(RunContext ctx, string connectionString, RunRe
     // ===== 全件更新：Blue/Green（ビュー/シノニム） =====
     private async Task FullBlueGreenAsync(SqlConnection conn, UpdateResult result, string label, CancellationToken ct)
     {
+        var (active, inactive) = await PrepareInactiveAsync(conn, result, label, ct);
+        var q = DbObjects.Q(inactive);
+
+        string switchSql;
+        string switchName;
+        if (req.Mode == PublishMode.View)
+        {
+            switchName = $"{label}: 切替 ALTER VIEW → {inactive}";
+            switchSql = $"{LockTimeoutSql()}{DbObjects.AlterViewSql(inactive)}";
+        }
+        else
+        {
+            switchName = $"{label}: 切替 SYNONYM → {inactive}";
+            switchSql = $"""
+                {LockTimeoutSql()}SET XACT_ABORT ON;
+                BEGIN TRAN;
+                    DROP SYNONYM {DbObjects.Q(DbObjects.PublicSynonym)};
+                    CREATE SYNONYM {DbObjects.Q(DbObjects.PublicSynonym)} FOR {q};
+                COMMIT;
+                """;
+        }
+        result.SwitchMs = await SwitchPhaseAsync(conn, result, switchName, switchSql, ct);
+    }
+
+    /// <summary>Blue/Green 共通：非アクティブ側を空にして連携元から BulkCopy する</summary>
+    private async Task<(string Active, string Inactive)> PrepareInactiveAsync(SqlConnection conn, UpdateResult result, string label, CancellationToken ct)
+    {
         var (blue, green) = DbObjects.BlueGreenOf(req.Mode);
         var active = await DbObjects.GetActiveTableAsync(conn, req.Mode, ct)
                      ?? throw new InvalidOperationException("公開オブジェクトの参照先を取得できません。環境セットアップを実行してください。");
@@ -171,26 +210,97 @@ public sealed class UpdaterWorker(RunContext ctx, string connectionString, RunRe
 
         result.RowsCopied = await BulkCopyPhaseAsync($"{label}: BulkCopy → {inactive}",
             $"SELECT {DbObjects.Columns} FROM {DbObjects.Q(DbObjects.Source)}", inactive, result, ct);
+        return (active, inactive);
+    }
 
-        string switchSql;
-        string switchName;
-        if (req.Mode == PublishMode.View)
+    // ===== 全件更新：ALTER TABLE SWITCH（代替案） =====
+    private async Task FullSwitchAsync(SqlConnection conn, UpdateResult result, string label, CancellationToken ct)
+    {
+        result.FromTable = DbObjects.SwStage;
+        result.ToTable = DbObjects.SwPublic;
+
+        // 投入先・退避先は読み取りから参照されないので、TRUNCATE してもブロックされない
+        var prepareSql = $"""
+            TRUNCATE TABLE {DbObjects.Q(DbObjects.SwStage)};
+            TRUNCATE TABLE {DbObjects.Q(DbObjects.SwOld)};
+            """;
+        result.PrepareMs = await ExecPhaseAsync(conn, $"{label}: 投入先・退避先を空にする", prepareSql, ct);
+
+        result.RowsCopied = await BulkCopyPhaseAsync($"{label}: BulkCopy → {DbObjects.SwStage}",
+            $"SELECT {DbObjects.Columns} FROM {DbObjects.Q(DbObjects.Source)}", DbObjects.SwStage, result, ct);
+
+        // 公開テーブル → 退避先、投入先 → 公開テーブルの順に SWITCH（どちらもメタデータ操作のみで一瞬）
+        var lowPriority = req.SwitchLowPriority
+            ? $" WITH (WAIT_AT_LOW_PRIORITY (MAX_DURATION = {req.LowPriorityMaxMinutes} MINUTES, ABORT_AFTER_WAIT = {req.LowPriorityAbort.ToString().ToUpperInvariant()}))"
+            : "";
+        var switchSql = $"""
+            {LockTimeoutSql()}SET XACT_ABORT ON;
+            BEGIN TRAN;
+                ALTER TABLE {DbObjects.Q(DbObjects.SwPublic)} SWITCH TO {DbObjects.Q(DbObjects.SwOld)}{lowPriority};
+                ALTER TABLE {DbObjects.Q(DbObjects.SwStage)} SWITCH TO {DbObjects.Q(DbObjects.SwPublic)};
+            COMMIT;
+            """;
+
+        // 低優先度の待機中に CommandTimeout で打ち切られないよう、待機時間 + 30 秒は待つ
+        int? timeout = null;
+        if (req.SwitchLowPriority && req.CommandTimeoutSec > 0 && req.CommandTimeoutSec < req.LowPriorityMaxMinutes * 60 + 30)
         {
-            switchName = $"{label}: 切替 ALTER VIEW → {inactive}";
-            switchSql = $"{LockTimeoutSql()}{DbObjects.AlterViewSql(inactive)}";
+            timeout = req.LowPriorityMaxMinutes * 60 + 30;
+            ctx.Info(Actor, $"低優先度の待機（最大 {req.LowPriorityMaxMinutes} 分）を確認するため、切替の CommandTimeout を {timeout} 秒にします");
         }
-        else
-        {
-            switchName = $"{label}: 切替 SYNONYM → {inactive}";
-            switchSql = $"""
-                {LockTimeoutSql()}SET XACT_ABORT ON;
-                BEGIN TRAN;
-                    DROP SYNONYM {DbObjects.Q(DbObjects.PublicSynonym)};
-                    CREATE SYNONYM {DbObjects.Q(DbObjects.PublicSynonym)} FOR {q};
-                COMMIT;
-                """;
-        }
-        result.SwitchMs = await SwitchPhaseAsync(conn, result, switchName, switchSql, ct);
+        var name = $"{label}: 切替 ALTER TABLE SWITCH{(req.SwitchLowPriority ? $"（低優先度 {req.LowPriorityMaxMinutes}分 / {req.LowPriorityAbort.ToString().ToUpperInvariant()}）" : "")}";
+        result.SwitchMs = await SwitchPhaseAsync(conn, result, name, switchSql, ct, timeout);
+    }
+
+    // ===== 全件更新：制御テーブル切替（代替案） =====
+    private async Task FullControlAsync(SqlConnection conn, UpdateResult result, string label, CancellationToken ct)
+    {
+        var (_, inactive) = await PrepareInactiveAsync(conn, result, label, ct);
+        var side = inactive == DbObjects.CtlA ? "A" : "B";
+        // ビュー定義は変えず、制御テーブルの値（DML）だけで参照先を切り替える
+        var switchSql = $"{LockTimeoutSql()}UPDATE {DbObjects.Q(DbObjects.CtlActive)} SET ActiveSide = '{side}' WHERE Id = 1;";
+        result.SwitchMs = await SwitchPhaseAsync(conn, result, $"{label}: 切替 UPDATE 制御テーブル → {inactive}", switchSql, ct);
+    }
+
+    // ===== 全件同期（テーブルを作り直さず MERGE で反映） =====
+    private async Task FullSyncAsync(SqlConnection conn, UpdateResult result, string label, CancellationToken ct)
+    {
+        var target = await DbObjects.GetActiveTableAsync(conn, req.Mode, ct)
+                     ?? throw new InvalidOperationException("公開オブジェクトの参照先を取得できません。環境セットアップを実行してください。");
+        result.FromTable = DbObjects.DiffStage;
+        result.ToTable = target;
+
+        var prepareSql = $"""
+            IF OBJECT_ID(N'{DbObjects.Q(DbObjects.DiffStage)}', N'U') IS NOT NULL DROP TABLE {DbObjects.Q(DbObjects.DiffStage)};
+            {DbObjects.CreateDataTableSql(DbObjects.DiffStage)}
+            """;
+        result.PrepareMs = await ExecPhaseAsync(conn, $"{label}: ステージング作成", prepareSql, ct);
+
+        // 連携元の全件を取得。変化を作るため 1 割の行は金額・更新日時を変える（毎回違う行）
+        var mod = 10;
+        var pick = (result.Index + Environment.TickCount) % mod;
+        var fullSql = $"""
+            SELECT Id, Code, Name,
+                   CASE WHEN Id % {mod} = {pick} THEN Amount + 1 ELSE Amount END AS Amount,
+                   CASE WHEN Id % {mod} = {pick} THEN SYSDATETIME() ELSE UpdatedAt END AS UpdatedAt,
+                   Payload
+            FROM {DbObjects.Q(DbObjects.Source)}
+            """;
+        result.RowsCopied = await BulkCopyPhaseAsync($"{label}: BulkCopy（全件）→ {DbObjects.DiffStage}", fullSql, DbObjects.DiffStage, result, ct);
+
+        // 変わった行だけ UPDATE、無い行を INSERT、連携元から消えた行を DELETE（公開テーブル自体は作り直さない）
+        var mergeSql = $"""
+            {LockTimeoutSql()}MERGE {DbObjects.Q(target)} AS t
+            USING {DbObjects.Q(DbObjects.DiffStage)} AS s ON t.Id = s.Id
+            WHEN MATCHED AND (t.Code <> s.Code OR t.Name <> s.Name OR t.Amount <> s.Amount OR t.UpdatedAt <> s.UpdatedAt OR t.Payload <> s.Payload) THEN
+                UPDATE SET Code = s.Code, Name = s.Name, Amount = s.Amount, UpdatedAt = s.UpdatedAt, Payload = s.Payload
+            WHEN NOT MATCHED BY TARGET THEN
+                INSERT ({DbObjects.Columns}) VALUES (s.Id, s.Code, s.Name, s.Amount, s.UpdatedAt, s.Payload)
+            WHEN NOT MATCHED BY SOURCE THEN
+                DELETE
+            OUTPUT $action;
+            """;
+        result.SwitchMs = await SwitchPhaseAsync(conn, result, $"{label}: 全件同期 MERGE → {target}", mergeSql, ct);
     }
 
     // ===== 差分更新 =====
@@ -237,7 +347,7 @@ public sealed class UpdaterWorker(RunContext ctx, string connectionString, RunRe
     /// ・「切替の N 秒前」に開始する読み取りがあれば、読み取り中になってから N 秒待って実行する
     /// ・切替がロック待機になったら「切替待機中」に開始する読み取りへ通知する
     /// </summary>
-    private async Task<long> SwitchPhaseAsync(SqlConnection conn, UpdateResult result, string name, string sql, CancellationToken ct)
+    private async Task<long> SwitchPhaseAsync(SqlConnection conn, UpdateResult result, string name, string sql, CancellationToken ct, int? timeoutSec = null)
     {
         var sig = ctx.SwitchOf(result.Index);
         sig.Ready.TrySetResult(true);
@@ -279,7 +389,8 @@ public sealed class UpdaterWorker(RunContext ctx, string connectionString, RunRe
         result.SwitchStartMs = ctx.ElapsedMs;
         try
         {
-            var exec = ExecPhaseAsync(conn, name, sql, ct, isSwitch: true);
+            var exec = ExecPhaseAsync(conn, name, sql, ct, isSwitch: true, timeoutSec);
+            sig.Started.TrySetResult(true);
             // ロック監視で検出できない場合（VIEW SERVER STATE がない等）の保険：3 秒たっても終わらなければ待機中とみなす
             var first = await Task.WhenAny(exec, Task.Delay(3000, ct));
             if (first != exec && !ct.IsCancellationRequested && sig.Blocked.TrySetResult(true))
@@ -293,19 +404,38 @@ public sealed class UpdaterWorker(RunContext ctx, string connectionString, RunRe
             result.SwitchEndMs = ctx.ElapsedMs;
             ctx.ActiveSwitchIndex = 0;
             sig.Blocked.TrySetResult(false);
+            sig.Started.TrySetResult(false);
         }
     }
 
     private string LockTimeoutSql() => req.LockTimeoutMs >= 0 ? $"SET LOCK_TIMEOUT {req.LockTimeoutMs};\n" : "";
 
     /// <summary>SQL を 1 フェーズとして実行し、所要時間を返す。失敗時はトランザクションを確実にロールバックする</summary>
-    private async Task<long> ExecPhaseAsync(SqlConnection conn, string name, string sql, CancellationToken ct, bool isSwitch = false)
+    private async Task<long> ExecPhaseAsync(SqlConnection conn, string name, string sql, CancellationToken ct, bool isSwitch = false, int? timeoutSec = null)
     {
-        ctx.Sql(Actor, $"{name} 開始{(isSwitch ? $"（CommandTimeout={req.CommandTimeoutSec}秒" + (req.LockTimeoutMs >= 0 ? $", LOCK_TIMEOUT={req.LockTimeoutMs}ms" : "") + "）" : "")}", sql);
+        var commandTimeout = timeoutSec ?? (isSwitch ? req.CommandTimeoutSec : 600);
+        ctx.Sql(Actor, $"{name} 開始{(isSwitch ? $"（CommandTimeout={commandTimeout}秒" + (req.LockTimeoutMs >= 0 ? $", LOCK_TIMEOUT={req.LockTimeoutMs}ms" : "") + "）" : "")}", sql);
         var phase = ctx.BeginPhase(Actor, name);
         try
         {
-            await using var cmd = new SqlCommand(sql, conn) { CommandTimeout = isSwitch ? req.CommandTimeoutSec : 600 };
+            await using var cmd = new SqlCommand(sql, conn) { CommandTimeout = commandTimeout };
+            if (sql.Contains("OUTPUT $action", StringComparison.Ordinal))
+            {
+                // MERGE の OUTPUT から INSERT/UPDATE/DELETE の件数を集計してログに出す
+                var counts = new Dictionary<string, long>();
+                await using (var reader = await cmd.ExecuteReaderAsync(ct))
+                {
+                    while (await reader.ReadAsync(ct))
+                    {
+                        var action = reader.GetString(0);
+                        counts[action] = counts.GetValueOrDefault(action) + 1;
+                    }
+                }
+                var msMerge = ctx.EndPhase(phase);
+                var detail = string.Join(" / ", new[] { "INSERT", "UPDATE", "DELETE" }.Select(a => $"{a} {counts.GetValueOrDefault(a):N0}行"));
+                ctx.Info(Actor, $"{name} 完了（{msMerge:N0}ms）: {detail}");
+                return msMerge;
+            }
             await cmd.ExecuteNonQueryAsync(ct);
             var ms = ctx.EndPhase(phase);
             ctx.Info(Actor, $"{name} 完了（{ms:N0}ms）");
@@ -394,6 +524,16 @@ public sealed class UpdaterWorker(RunContext ctx, string connectionString, RunRe
         PublishMode.Table => "テーブル公開（現行: DROP+RENAME）",
         PublishMode.View => "ビュー公開（改修後: ALTER VIEW）",
         PublishMode.Synonym => "シノニム公開（参考）",
+        PublishMode.Switch => "テーブル公開 + ALTER TABLE SWITCH（代替案）",
+        PublishMode.Control => "制御テーブル切替ビュー（代替案: DDL なし）",
         _ => mode.ToString(),
+    };
+
+    public static string UpdateTypeText(UpdateType type) => type switch
+    {
+        UpdateType.Full => "全件更新（入替）",
+        UpdateType.Diff => "差分更新（MERGE）",
+        UpdateType.FullSync => "全件同期（MERGE で INSERT/UPDATE/DELETE）",
+        _ => type.ToString(),
     };
 }

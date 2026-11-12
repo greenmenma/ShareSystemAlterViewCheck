@@ -195,6 +195,8 @@ input:disabled, select:disabled { opacity: .5; }
 .tag-table { color: var(--error); border-color: var(--error); }
 .tag-view { color: var(--success); border-color: var(--success); }
 .tag-synonym { color: var(--monitor); border-color: var(--monitor); }
+.tag-switch,
+.tag-control { color: var(--primary); border-color: var(--primary); font-weight: 600; }
 
 .status { font-size: 11px; font-weight: 600; }
 .status-running { color: var(--running); }
