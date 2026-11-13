@@ -19,6 +19,7 @@ SQL Server のデータ公開システムで発生する **全件更新時のロ
 ## 検証の内容
 
 検証の経緯・結論・本命の方式のフローチャートは [docs/lock-verification-summary.md](docs/lock-verification-summary.md) にまとめています。
+本命の公開ビューのインデックス・整合性などの検証は [docs/control-view-verification.md](docs/control-view-verification.md) にまとめています。
 
 | 方式 | 全件更新の手順 |
 | --- | --- |

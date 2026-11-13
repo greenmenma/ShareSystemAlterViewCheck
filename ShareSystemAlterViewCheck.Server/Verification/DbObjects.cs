@@ -73,19 +73,20 @@ public static class DbObjects
 
     /// <summary>
     /// 制御テーブル切替のビュー。定義は固定で、切替は制御テーブルの UPDATE（DML）だけで行う。
-    /// 制御テーブルを外側で 1 回だけ読み、その値で片側だけを読む（非アクティブ側は実行時に読まれない）。
-    /// 1 文の中で参照先が混ざらないので、READ COMMITTED でも途中で切り替わっても重複・欠落しない。
+    /// UNION ALL の各側に「制御テーブルの値がその側か」をスカラーサブクエリで付ける。
+    /// 利用者の WHERE・JOIN 条件が各テーブルまで押し込まれるのでインデックス（Seek）が効き、
+    /// 制御テーブルの判定が先に行われるので、非アクティブ側は通常読まれない。
+    /// 以前の CROSS APPLY 版（制御テーブルを 1 回だけ読む形）は条件が押し込まれず、毎回全件スキャンになった。
+    /// 制御テーブルを各側で 1 回ずつ読むため、1 文の中で A/B が混ざらないことは RCSI（ステートメント単位のスナップショット）が前提。
+    /// RCSI OFF や NOLOCK の読み取りでは、切替と重なると重複（両側）や 0 件になることがある（docs 参照）。
     /// </summary>
     public static string CreateCtlViewSql() => $"""
         CREATE VIEW {Q(CtlView)} AS
-        SELECT x.{Columns.Replace(", ", ", x.")}
-        FROM {Q(CtlActive)} c
-        CROSS APPLY (
-            SELECT {Columns} FROM {Q(CtlA)} WHERE c.ActiveSide = 'A'
-            UNION ALL
-            SELECT {Columns} FROM {Q(CtlB)} WHERE c.ActiveSide = 'B'
-        ) x
-        WHERE c.Id = 1;
+        SELECT {Columns} FROM {Q(CtlA)}
+        WHERE (SELECT ActiveSide FROM {Q(CtlActive)} WHERE Id = 1) = 'A'
+        UNION ALL
+        SELECT {Columns} FROM {Q(CtlB)}
+        WHERE (SELECT ActiveSide FROM {Q(CtlActive)} WHERE Id = 1) = 'B';
         """;
 
     /// <summary>公開方式ごとの公開オブジェクト名（読み取り側が参照する名前）</summary>
